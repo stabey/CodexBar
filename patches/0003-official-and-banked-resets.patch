@@ -1,0 +1,768 @@
+From 9bcb629c62b91fc5675ddb58665b1f410aafea4c Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sun, 30 Aug 2026 05:21:52 +0000
+Subject: [PATCH 3/4] Split quota cost across official and banked weekly resets
+
+Previous This week / Last week rows assumed a regular 7-day grid from
+the live next reset. Observed Weekly resetsAt samples and redeemed
+reset-credit times now become extra window boundaries, so an official
+rollover and a later banked reset on the same day get separate cost
+totals. Short windows are labeled Previous window instead of Last week.
+
+Co-authored-by: stabeyzhou <stabeyzhou@gmail.com>
+---
+ CHANGELOG.md                                  |   2 +-
+ .../InlineUsageDashboardContent.swift         |  37 ++++--
+ .../CodexBar/MenuCardView+ModelInput.swift    |   5 +-
+ .../CodexBar/PreferencesProvidersPane.swift   |   6 +-
+ .../Resources/ar.lproj/Localizable.strings    |   2 +
+ .../Resources/ca.lproj/Localizable.strings    |   2 +
+ .../Resources/de.lproj/Localizable.strings    |   2 +
+ .../Resources/en.lproj/Localizable.strings    |   2 +
+ .../Resources/es.lproj/Localizable.strings    |   2 +
+ .../Resources/fa.lproj/Localizable.strings    |   2 +
+ .../Resources/fr.lproj/Localizable.strings    |   2 +
+ .../Resources/gl.lproj/Localizable.strings    |   2 +
+ .../Resources/id.lproj/Localizable.strings    |   2 +
+ .../Resources/it.lproj/Localizable.strings    |   2 +
+ .../Resources/ja.lproj/Localizable.strings    |   2 +
+ .../Resources/ko.lproj/Localizable.strings    |   2 +
+ .../Resources/nl.lproj/Localizable.strings    |   2 +
+ .../Resources/pl.lproj/Localizable.strings    |   2 +
+ .../Resources/pt-BR.lproj/Localizable.strings |   2 +
+ .../Resources/ru.lproj/Localizable.strings    |   2 +
+ .../Resources/sv.lproj/Localizable.strings    |   2 +
+ .../Resources/th.lproj/Localizable.strings    |   2 +
+ .../Resources/tr.lproj/Localizable.strings    |   2 +
+ .../Resources/uk.lproj/Localizable.strings    |   2 +
+ .../Resources/vi.lproj/Localizable.strings    |   2 +
+ .../zh-Hans.lproj/Localizable.strings         |   2 +
+ .../zh-Hant.lproj/Localizable.strings         |   2 +
+ .../StatusItemController+MenuCardModel.swift  |  26 +++-
+ Sources/CodexBarCore/CostUsageModels.swift    | 115 ++++++++++++++++--
+ TestsLinux/CostUsageQuotaWeekLinuxTests.swift |  47 +++++++
+ 30 files changed, 263 insertions(+), 21 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 011e684ff..33f53cfa1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,7 +3,7 @@
+ ## 0.56.1 — Unreleased
+ 
+ ### Added
+-- Codex and Claude: show this week's local cost and tokens next to Today, split at the live Weekly reset instant rather than double-counting the reset calendar day, with compact Last week / 2–3 weeks ago totals under the daily chart.
++- Codex and Claude: show this week's local cost and tokens next to Today, split at the live Weekly reset instant rather than double-counting the reset calendar day, with compact Last week / previous-window totals under the daily chart. Official and banked resets observed on the same day become separate windows when a prior Weekly `resetsAt` or redeemed reset credit is still on file.
+ 
+ ### Fixed
+ - Antigravity: reuse a running `agy` by its verified executable path even when its command line uses a bare name, and preserve CLI sign-in guidance when an IDE fallback has no CSRF token (follow-up to #3146). Thanks @haixing23!
+diff --git a/Sources/CodexBar/InlineUsageDashboardContent.swift b/Sources/CodexBar/InlineUsageDashboardContent.swift
+index 71c4f9cb4..e5a1a49e1 100644
+--- a/Sources/CodexBar/InlineUsageDashboardContent.swift
++++ b/Sources/CodexBar/InlineUsageDashboardContent.swift
+@@ -104,7 +104,10 @@ extension UsageMenuCardView.Model {
+                 comparisonPeriodsEnabled: input.costComparisonPeriodsEnabled,
+                 preferredCurrencyCode: input.preferredCurrencyCode,
+                 calendar: input.costUsageBucketCalendar,
+-                weeklyWindow: input.snapshot?.secondary)
++                weeklyWindow: input.snapshot?.secondary,
++                observedNextResets: input.observedWeeklyNextResets,
++                observedResetInstants: Self.redeemedWeeklyResetInstants(from: input.snapshot),
++                now: input.now)
+         }
+         if menuCard.supportsInlineTokenCostDashboard,
+            input.costSummaryInlineEnabled,
+@@ -117,7 +120,10 @@ extension UsageMenuCardView.Model {
+                 comparisonPeriodsEnabled: input.costComparisonPeriodsEnabled,
+                 preferredCurrencyCode: input.preferredCurrencyCode,
+                 calendar: input.costUsageBucketCalendar,
+-                weeklyWindow: input.snapshot?.secondary)
++                weeklyWindow: input.snapshot?.secondary,
++                observedNextResets: input.observedWeeklyNextResets,
++                observedResetInstants: Self.redeemedWeeklyResetInstants(from: input.snapshot),
++                now: input.now)
+         }
+         return nil
+     }
+@@ -143,7 +149,10 @@ extension UsageMenuCardView.Model {
+         comparisonPeriodsEnabled: Bool,
+         preferredCurrencyCode: String,
+         calendar: Calendar,
+-        weeklyWindow: RateWindow?) -> InlineUsageDashboardModel
++        weeklyWindow: RateWindow?,
++        observedNextResets: [Date] = [],
++        observedResetInstants: [Date] = [],
++        now: Date? = nil) -> InlineUsageDashboardModel
+     {
+         let displayCurrencyCode = UsageFormatter.convertedCost(
+             0,
+@@ -215,6 +224,9 @@ extension UsageMenuCardView.Model {
+             ? snapshot.quotaWeekSummaries(
+                 resetAt: CostUsageTokenSnapshot.quotaWeekReset(from: weeklyWindow),
+                 windowMinutes: weeklyWindow?.windowMinutes,
++                observedNextResets: observedNextResets,
++                observedResetInstants: observedResetInstants,
++                now: now,
+                 calendar: calendar)
+             : []
+         let currentWeek = quotaWeeks.first { $0.isCurrent }
+@@ -324,8 +336,15 @@ extension UsageMenuCardView.Model {
+         return model
+     }
+ 
++    private static func redeemedWeeklyResetInstants(from snapshot: UsageSnapshot?) -> [Date] {
++        snapshot?.codexResetCredits?.credits.compactMap { credit in
++            guard credit.status == .redeemed else { return nil }
++            return credit.redeemedAt
++        } ?? []
++    }
++
+     private static func quotaWeekDetailLine(week: CostUsageQuotaWeek, cost: String) -> String {
+-        let label = Self.quotaWeekHistoryLabel(offset: week.offset)
++        let label = Self.quotaWeekHistoryLabel(week: week)
+         guard let totalTokens = week.totalTokens else { return "\(label): \(cost)" }
+         return String(
+             format: L("%@: %@ · %@ tokens"),
+@@ -334,14 +353,16 @@ extension UsageMenuCardView.Model {
+             UsageFormatter.tokenCountString(totalTokens))
+     }
+ 
+-    private static func quotaWeekHistoryLabel(offset: Int) -> String {
+-        switch offset {
++    private static func quotaWeekHistoryLabel(week: CostUsageQuotaWeek) -> String {
++        switch week.offset {
+         case 0:
+             return L("This week")
+         case 1:
+-            return L("Last week")
++            return week.isNominalWeek ? L("Last week") : L("Previous window")
+         default:
+-            return L("%d weeks ago", offset)
++            return week.isNominalWeek
++                ? L("%d weeks ago", week.offset)
++                : L("%d windows ago", week.offset)
+         }
+     }
+ 
+diff --git a/Sources/CodexBar/MenuCardView+ModelInput.swift b/Sources/CodexBar/MenuCardView+ModelInput.swift
+index ece3d6a73..39b62596f 100644
+--- a/Sources/CodexBar/MenuCardView+ModelInput.swift
++++ b/Sources/CodexBar/MenuCardView+ModelInput.swift
+@@ -48,6 +48,7 @@ extension UsageMenuCardView.Model {
+         let preferredCurrencyCode: String
+         let costUsageBucketCalendar: Calendar
+         let now: Date
++        let observedWeeklyNextResets: [Date]
+ 
+         init(
+             provider: UsageProvider,
+@@ -92,7 +93,8 @@ extension UsageMenuCardView.Model {
+             usesLiveSubtitle: Bool = false,
+             preferredCurrencyCode: String = "auto",
+             costUsageBucketCalendar: Calendar = .current,
+-            now: Date)
++            now: Date,
++            observedWeeklyNextResets: [Date] = [])
+         {
+             self.provider = provider
+             self.metadata = metadata
+@@ -137,6 +139,7 @@ extension UsageMenuCardView.Model {
+             self.preferredCurrencyCode = preferredCurrencyCode
+             self.costUsageBucketCalendar = costUsageBucketCalendar
+             self.now = now
++            self.observedWeeklyNextResets = observedWeeklyNextResets
+         }
+     }
+ }
+diff --git a/Sources/CodexBar/PreferencesProvidersPane.swift b/Sources/CodexBar/PreferencesProvidersPane.swift
+index 7e3f6efb8..5a251dd7e 100644
+--- a/Sources/CodexBar/PreferencesProvidersPane.swift
++++ b/Sources/CodexBar/PreferencesProvidersPane.swift
+@@ -610,7 +610,11 @@ struct ProvidersPane: View {
+             workdayTickAppearance: self.settings.workdayTickAppearance,
+             paceVisible: self.settings.paceVisible,
+             costUsageBucketCalendar: self.settings.costUsageBucketCalendar,
+-            now: now)
++            now: now,
++            observedWeeklyNextResets: self.store.planUtilizationHistorySelection(for: provider)
++                .histories
++                .first { $0.name == .weekly }?
++                .entries.compactMap(\.resetsAt) ?? [])
+         return UsageMenuCardView.Model.make(input)
+     }
+ 
+diff --git a/Sources/CodexBar/Resources/ar.lproj/Localizable.strings b/Sources/CodexBar/Resources/ar.lproj/Localizable.strings
+index 686c1ef7e..d731bb866 100644
+--- a/Sources/CodexBar/Resources/ar.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/ar.lproj/Localizable.strings
+@@ -890,6 +890,8 @@
+ "This week" = "هذا الأسبوع";
+ "Last week" = "الأسبوع الماضي";
+ "%d weeks ago" = "قبل %d أسابيع";
++"Previous window" = "النافذة السابقة";
++"%d windows ago" = "قبل %d نوافذ";
+ "Week" = "الأسبوع";
+ "Month" = "الشهر";
+ "Models" = "النماذج";
+diff --git a/Sources/CodexBar/Resources/ca.lproj/Localizable.strings b/Sources/CodexBar/Resources/ca.lproj/Localizable.strings
+index 45e5ca5c0..9abefaa98 100644
+--- a/Sources/CodexBar/Resources/ca.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/ca.lproj/Localizable.strings
+@@ -897,6 +897,8 @@
+ "This week" = "Aquesta setmana";
+ "Last week" = "La setmana passada";
+ "%d weeks ago" = "fa %d setmanes";
++"Previous window" = "Finestra anterior";
++"%d windows ago" = "fa %d finestres";
+ "This month" = "Aquest mes";
+ "Week" = "Setmana";
+ "Month" = "Mes";
+diff --git a/Sources/CodexBar/Resources/de.lproj/Localizable.strings b/Sources/CodexBar/Resources/de.lproj/Localizable.strings
+index 1dcadd4d7..88930e902 100644
+--- a/Sources/CodexBar/Resources/de.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/de.lproj/Localizable.strings
+@@ -882,6 +882,8 @@
+ "This week" = "Diese Woche";
+ "Last week" = "Letzte Woche";
+ "%d weeks ago" = "vor %d Wochen";
++"Previous window" = "Vorheriges Fenster";
++"%d windows ago" = "vor %d Fenstern";
+ "Week" = "Woche";
+ "Month" = "Monat";
+ "Models" = "Modelle";
+diff --git a/Sources/CodexBar/Resources/en.lproj/Localizable.strings b/Sources/CodexBar/Resources/en.lproj/Localizable.strings
+index 137aaff65..ba0087daa 100644
+--- a/Sources/CodexBar/Resources/en.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/en.lproj/Localizable.strings
+@@ -870,6 +870,8 @@
+ "This week" = "This week";
+ "Last week" = "Last week";
+ "%d weeks ago" = "%d weeks ago";
++"Previous window" = "Previous window";
++"%d windows ago" = "%d windows ago";
+ "Week" = "Week";
+ "Month" = "Month";
+ "Models" = "Models";
+diff --git a/Sources/CodexBar/Resources/es.lproj/Localizable.strings b/Sources/CodexBar/Resources/es.lproj/Localizable.strings
+index 28ff1af76..787612f06 100644
+--- a/Sources/CodexBar/Resources/es.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/es.lproj/Localizable.strings
+@@ -899,6 +899,8 @@
+ "This week" = "Esta semana";
+ "Last week" = "La semana pasada";
+ "%d weeks ago" = "hace %d semanas";
++"Previous window" = "Ventana anterior";
++"%d windows ago" = "hace %d ventanas";
+ "This month" = "Este mes";
+ "Week" = "Semana";
+ "Month" = "Mes";
+diff --git a/Sources/CodexBar/Resources/fa.lproj/Localizable.strings b/Sources/CodexBar/Resources/fa.lproj/Localizable.strings
+index b5c1ce3a0..f35b9d474 100644
+--- a/Sources/CodexBar/Resources/fa.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/fa.lproj/Localizable.strings
+@@ -890,6 +890,8 @@
+ "This week" = "این هفته";
+ "Last week" = "هفته گذشته";
+ "%d weeks ago" = "%d هفته پیش";
++"Previous window" = "پنجره قبلی";
++"%d windows ago" = "%d پنجره پیش";
+ "Week" = "هفته";
+ "Month" = "ماه";
+ "Models" = "مدل ها";
+diff --git a/Sources/CodexBar/Resources/fr.lproj/Localizable.strings b/Sources/CodexBar/Resources/fr.lproj/Localizable.strings
+index 2e81f0361..73ac54b08 100644
+--- a/Sources/CodexBar/Resources/fr.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/fr.lproj/Localizable.strings
+@@ -884,6 +884,8 @@
+ "This week" = "Cette semaine";
+ "Last week" = "La semaine dernière";
+ "%d weeks ago" = "il y a %d semaines";
++"Previous window" = "Fenêtre précédente";
++"%d windows ago" = "il y a %d fenêtres";
+ "Week" = "Semaine";
+ "Month" = "Mois";
+ "Models" = "Modèles";
+diff --git a/Sources/CodexBar/Resources/gl.lproj/Localizable.strings b/Sources/CodexBar/Resources/gl.lproj/Localizable.strings
+index edb994f61..e798664cd 100644
+--- a/Sources/CodexBar/Resources/gl.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/gl.lproj/Localizable.strings
+@@ -886,6 +886,8 @@
+ "This week" = "Esta semana";
+ "Last week" = "A semana pasada";
+ "%d weeks ago" = "hai %d semanas";
++"Previous window" = "Xanela anterior";
++"%d windows ago" = "hai %d xanelas";
+ "This month" = "Este mes";
+ "Week" = "Semana";
+ "Month" = "Mes";
+diff --git a/Sources/CodexBar/Resources/id.lproj/Localizable.strings b/Sources/CodexBar/Resources/id.lproj/Localizable.strings
+index 1c0345dec..eb8a865ca 100644
+--- a/Sources/CodexBar/Resources/id.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/id.lproj/Localizable.strings
+@@ -892,6 +892,8 @@
+ "This week" = "Minggu ini";
+ "Last week" = "Minggu lalu";
+ "%d weeks ago" = "%d minggu lalu";
++"Previous window" = "Jendela sebelumnya";
++"%d windows ago" = "%d jendela lalu";
+ "Week" = "Minggu";
+ "Month" = "Bulan";
+ "Models" = "Model";
+diff --git a/Sources/CodexBar/Resources/it.lproj/Localizable.strings b/Sources/CodexBar/Resources/it.lproj/Localizable.strings
+index 230f7d288..0a6b78a94 100644
+--- a/Sources/CodexBar/Resources/it.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/it.lproj/Localizable.strings
+@@ -892,6 +892,8 @@
+ "This week" = "Questa settimana";
+ "Last week" = "La settimana scorsa";
+ "%d weeks ago" = "%d settimane fa";
++"Previous window" = "Finestra precedente";
++"%d windows ago" = "%d finestre fa";
+ "Week" = "Settimana";
+ "Month" = "Mese";
+ "Models" = "Modelli";
+diff --git a/Sources/CodexBar/Resources/ja.lproj/Localizable.strings b/Sources/CodexBar/Resources/ja.lproj/Localizable.strings
+index b292ced86..313ca439b 100644
+--- a/Sources/CodexBar/Resources/ja.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/ja.lproj/Localizable.strings
+@@ -881,6 +881,8 @@
+ "This week" = "今週";
+ "Last week" = "先週";
+ "%d weeks ago" = "%d週間前";
++"Previous window" = "前のウィンドウ";
++"%d windows ago" = "%dウィンドウ前";
+ "Week" = "週";
+ "Month" = "月";
+ "Models" = "モデル";
+diff --git a/Sources/CodexBar/Resources/ko.lproj/Localizable.strings b/Sources/CodexBar/Resources/ko.lproj/Localizable.strings
+index 03e73769d..f36dc7b4f 100644
+--- a/Sources/CodexBar/Resources/ko.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/ko.lproj/Localizable.strings
+@@ -856,6 +856,8 @@
+ "This week" = "이번 주";
+ "Last week" = "지난주";
+ "%d weeks ago" = "%d주 전";
++"Previous window" = "이전 구간";
++"%d windows ago" = "%d개 구간 전";
+ "Week" = "주";
+ "Month" = "월";
+ "Models" = "모델";
+diff --git a/Sources/CodexBar/Resources/nl.lproj/Localizable.strings b/Sources/CodexBar/Resources/nl.lproj/Localizable.strings
+index e2d5de453..93dc8fce1 100644
+--- a/Sources/CodexBar/Resources/nl.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/nl.lproj/Localizable.strings
+@@ -884,6 +884,8 @@
+ "This week" = "Deze week";
+ "Last week" = "Vorige week";
+ "%d weeks ago" = "%d weken geleden";
++"Previous window" = "Vorig venster";
++"%d windows ago" = "%d vensters geleden";
+ "Week" = "Week";
+ "Month" = "Maand";
+ "Models" = "Modellen";
+diff --git a/Sources/CodexBar/Resources/pl.lproj/Localizable.strings b/Sources/CodexBar/Resources/pl.lproj/Localizable.strings
+index bed61b31d..6bc111dca 100644
+--- a/Sources/CodexBar/Resources/pl.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/pl.lproj/Localizable.strings
+@@ -892,6 +892,8 @@
+ "This week" = "Ten tydzień";
+ "Last week" = "Zeszły tydzień";
+ "%d weeks ago" = "%d tyg. temu";
++"Previous window" = "Poprzednie okno";
++"%d windows ago" = "%d okna temu";
+ "Week" = "Tydzień";
+ "Month" = "Miesiąc";
+ "Models" = "Modele";
+diff --git a/Sources/CodexBar/Resources/pt-BR.lproj/Localizable.strings b/Sources/CodexBar/Resources/pt-BR.lproj/Localizable.strings
+index 0e856aeff..4c3ac6116 100644
+--- a/Sources/CodexBar/Resources/pt-BR.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/pt-BR.lproj/Localizable.strings
+@@ -881,6 +881,8 @@
+ "This week" = "Esta semana";
+ "Last week" = "Semana passada";
+ "%d weeks ago" = "%d semanas atrás";
++"Previous window" = "Janela anterior";
++"%d windows ago" = "%d janelas atrás";
+ "Week" = "Semana";
+ "Month" = "Mês";
+ "Models" = "Modelos";
+diff --git a/Sources/CodexBar/Resources/ru.lproj/Localizable.strings b/Sources/CodexBar/Resources/ru.lproj/Localizable.strings
+index bcfe8b9c5..85619aa6c 100644
+--- a/Sources/CodexBar/Resources/ru.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/ru.lproj/Localizable.strings
+@@ -885,6 +885,8 @@
+ "This week" = "На этой неделе";
+ "Last week" = "Прошлая неделя";
+ "%d weeks ago" = "%d нед. назад";
++"Previous window" = "Предыдущее окно";
++"%d windows ago" = "%d окн. назад";
+ "Week" = "неделя";
+ "Month" = "Месяц";
+ "Models" = "Модели";
+diff --git a/Sources/CodexBar/Resources/sv.lproj/Localizable.strings b/Sources/CodexBar/Resources/sv.lproj/Localizable.strings
+index 7d1afad3d..817d2ecc8 100644
+--- a/Sources/CodexBar/Resources/sv.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/sv.lproj/Localizable.strings
+@@ -883,6 +883,8 @@
+ "This week" = "Den här veckan";
+ "Last week" = "Förra veckan";
+ "%d weeks ago" = "för %d veckor sedan";
++"Previous window" = "Föregående fönster";
++"%d windows ago" = "för %d fönster sedan";
+ "Week" = "Vecka";
+ "Month" = "Månad";
+ "Models" = "Modeller";
+diff --git a/Sources/CodexBar/Resources/th.lproj/Localizable.strings b/Sources/CodexBar/Resources/th.lproj/Localizable.strings
+index 34e7ac21c..905c14110 100644
+--- a/Sources/CodexBar/Resources/th.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/th.lproj/Localizable.strings
+@@ -890,6 +890,8 @@
+ "This week" = "สัปดาห์นี้";
+ "Last week" = "สัปดาห์ที่แล้ว";
+ "%d weeks ago" = "%d สัปดาห์ที่แล้ว";
++"Previous window" = "หน้าต่างก่อน";
++"%d windows ago" = "%d หน้าต่างที่แล้ว";
+ "Week" = "สัปดาห์";
+ "Month" = "เดือน";
+ "Models" = "โมเดล";
+diff --git a/Sources/CodexBar/Resources/tr.lproj/Localizable.strings b/Sources/CodexBar/Resources/tr.lproj/Localizable.strings
+index 84a12e7cc..afe0d80bb 100644
+--- a/Sources/CodexBar/Resources/tr.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/tr.lproj/Localizable.strings
+@@ -886,6 +886,8 @@
+ "This week" = "Bu hafta";
+ "Last week" = "Geçen hafta";
+ "%d weeks ago" = "%d hafta önce";
++"Previous window" = "Önceki pencere";
++"%d windows ago" = "%d pencere önce";
+ "Week" = "Hafta";
+ "Month" = "Ay";
+ "Models" = "Modeller";
+diff --git a/Sources/CodexBar/Resources/uk.lproj/Localizable.strings b/Sources/CodexBar/Resources/uk.lproj/Localizable.strings
+index 45d74d292..2f03344be 100644
+--- a/Sources/CodexBar/Resources/uk.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/uk.lproj/Localizable.strings
+@@ -884,6 +884,8 @@
+ "This week" = "Цього тижня";
+ "Last week" = "Минулого тижня";
+ "%d weeks ago" = "%d тиж. тому";
++"Previous window" = "Попереднє вікно";
++"%d windows ago" = "%d вікн. тому";
+ "Week" = "тиждень";
+ "Month" = "місяць";
+ "Models" = "Моделі";
+diff --git a/Sources/CodexBar/Resources/vi.lproj/Localizable.strings b/Sources/CodexBar/Resources/vi.lproj/Localizable.strings
+index bd255173b..7e8fba6f0 100644
+--- a/Sources/CodexBar/Resources/vi.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/vi.lproj/Localizable.strings
+@@ -880,6 +880,8 @@
+ "This week" = "Tuần này";
+ "Last week" = "Tuần trước";
+ "%d weeks ago" = "%d tuần trước";
++"Previous window" = "Cửa sổ trước";
++"%d windows ago" = "%d cửa sổ trước";
+ "Week" = "Tuần";
+ "Month" = "Tháng";
+ "Models" = "Mô hình";
+diff --git a/Sources/CodexBar/Resources/zh-Hans.lproj/Localizable.strings b/Sources/CodexBar/Resources/zh-Hans.lproj/Localizable.strings
+index d2f74aa2d..d9b40e27a 100644
+--- a/Sources/CodexBar/Resources/zh-Hans.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/zh-Hans.lproj/Localizable.strings
+@@ -846,6 +846,8 @@
+ "This week" = "本周";
+ "Last week" = "上周";
+ "%d weeks ago" = "%d 周前";
++"Previous window" = "上一窗口";
++"%d windows ago" = "%d 个窗口前";
+ "Week" = "本周";
+ "Month" = "本月";
+ "Models" = "模型";
+diff --git a/Sources/CodexBar/Resources/zh-Hant.lproj/Localizable.strings b/Sources/CodexBar/Resources/zh-Hant.lproj/Localizable.strings
+index 92124d79e..5ffefd7c9 100644
+--- a/Sources/CodexBar/Resources/zh-Hant.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/zh-Hant.lproj/Localizable.strings
+@@ -900,6 +900,8 @@
+ "This week" = "本週";
+ "Last week" = "上週";
+ "%d weeks ago" = "%d 週前";
++"Previous window" = "上一視窗";
++"%d windows ago" = "%d 個視窗前";
+ "Week" = "週";
+ "Month" = "月";
+ "Models" = "模型";
+diff --git a/Sources/CodexBar/StatusItemController+MenuCardModel.swift b/Sources/CodexBar/StatusItemController+MenuCardModel.swift
+index f317db5d6..1989c7d2f 100644
+--- a/Sources/CodexBar/StatusItemController+MenuCardModel.swift
++++ b/Sources/CodexBar/StatusItemController+MenuCardModel.swift
+@@ -164,7 +164,12 @@ extension StatusItemController {
+             usesLiveSubtitle: surface == .liveCard,
+             preferredCurrencyCode: self.settings.preferredCurrencyCode,
+             costUsageBucketCalendar: self.settings.costUsageBucketCalendar,
+-            now: now)
++            now: now,
++            observedWeeklyNextResets: self.observedWeeklyNextResets(
++                for: target,
++                snapshot: snapshot,
++                historySelection: historySelectionOverride,
++                usesOverrideCard: surface == .overrideCard))
+         return UsageMenuCardView.Model.make(input)
+     }
+ 
+@@ -277,6 +282,25 @@ extension StatusItemController {
+         AccountInfo(email: account.email, plan: account.workspaceLabel)
+     }
+ 
++    private func observedWeeklyNextResets(
++        for provider: UsageProvider,
++        snapshot: UsageSnapshot?,
++        historySelection: PlanUtilizationHistorySelection?,
++        usesOverrideCard: Bool) -> [Date]
++    {
++        let selection: PlanUtilizationHistorySelection
++        if let historySelection {
++            selection = historySelection
++        } else if usesOverrideCard, let snapshot {
++            selection = self.store.planUtilizationHistorySelection(for: provider, snapshotOverride: snapshot)
++        } else {
++            selection = self.store.planUtilizationHistorySelection(for: provider)
++        }
++        return selection.histories
++            .first { $0.name == .weekly }?
++            .entries.compactMap(\.resetsAt) ?? []
++    }
++
+     private func quotaWarningMarkerThresholds(provider: UsageProvider, window: QuotaWarningWindow) -> [Int] {
+         guard self.settings.quotaWarningMarkersVisible else { return [] }
+         guard self.settings.quotaWarningEnabled(provider: provider, window: window) else { return [] }
+diff --git a/Sources/CodexBarCore/CostUsageModels.swift b/Sources/CodexBarCore/CostUsageModels.swift
+index 0e376e93f..50e1ca5b1 100644
+--- a/Sources/CodexBarCore/CostUsageModels.swift
++++ b/Sources/CodexBarCore/CostUsageModels.swift
+@@ -50,12 +50,13 @@ public struct CostUsageWindowSummary: Sendable, Equatable {
+     }
+ }
+ 
+-/// A 7-day quota window derived from local cost history.
++/// A quota window derived from local cost history.
+ ///
+ /// When `resetAt` is known, windows line up with the live Weekly bar rather than a rolling
+-/// calendar "last 7 days". Hour buckets split a reset day at the reset instant; each hour
+-/// belongs to exactly one window. Daily-only snapshots fall back to exclusive day membership
+-/// so a boundary calendar day is never counted twice.
++/// calendar "last 7 days". Observed extra resets (official rollover plus a banked reset) become
++/// additional boundaries. Hour buckets split a reset day at the reset instant; each hour belongs
++/// to exactly one window. Daily-only snapshots fall back to exclusive day membership so a
++/// boundary calendar day is never counted twice.
+ public struct CostUsageQuotaWeek: Sendable, Equatable {
+     public let offset: Int
+     public let start: Date
+@@ -68,6 +69,12 @@ public struct CostUsageQuotaWeek: Sendable, Equatable {
+         self.offset == 0
+     }
+ 
++    /// True when this window is within a day of the nominal 7×24h weekly quota.
++    public var isNominalWeek: Bool {
++        abs(self.end.timeIntervalSince(self.start) - TimeInterval(CostUsageTokenSnapshot.quotaWeekMinutes * 60))
++            < 24 * 60 * 60
++    }
++
+     public init(
+         offset: Int,
+         start: Date,
+@@ -282,15 +289,23 @@ public struct CostUsageTokenSnapshot: Sendable, Equatable {
+ 
+     public static let quotaWeekMinutes = 7 * 24 * 60
+ 
+-    /// Buckets local cost into consecutive 7-day windows.
++    /// Buckets local cost into consecutive quota windows.
+     ///
+     /// Pass the live Weekly `resetsAt` / `windowMinutes` to match the quota bar. When reset
+     /// metadata is missing, windows fall back to rolling calendar weeks ending tomorrow.
+     /// Hour entries use half-open `[start, end)` membership so a reset-day hour is never
+     /// counted in two weeks. Daily-only history uses the day's start instant the same way.
++    ///
++    /// `observedNextResets` are previously published Weekly `resetsAt` values (for example from
++    /// plan-utilization samples). An elapsed stored next-reset is treated as a real reset instant,
++    /// so an official rollover and a later banked reset on the same day become two windows instead
++    /// of one 7-day block. `observedResetInstants` are known start times such as a redeemed
++    /// reset-credit `redeemedAt`.
+     public func quotaWeekSummaries(
+         resetAt: Date?,
+         windowMinutes: Int? = nil,
++        observedNextResets: [Date] = [],
++        observedResetInstants: [Date] = [],
+         weekCount: Int = 4,
+         now: Date? = nil,
+         calendar: Calendar = .current) -> [CostUsageQuotaWeek]
+@@ -318,13 +333,22 @@ public struct CostUsageTokenSnapshot: Sendable, Equatable {
+             }
+ 
+         let count = max(1, min(weekCount, 8))
++        let boundaries = Self.quotaWeekBoundaries(
++            currentEnd: currentEnd,
++            duration: duration,
++            observedNextResets: observedNextResets,
++            observedResetInstants: observedResetInstants,
++            weekCount: count)
+         var weeks: [CostUsageQuotaWeek] = []
+         weeks.reserveCapacity(count)
+-        for offset in 0..<count {
+-            let end = currentEnd.addingTimeInterval(-duration * TimeInterval(offset))
+-            let start = end.addingTimeInterval(-duration)
++        var offset = 0
++        var endIndex = boundaries.count - 1
++        while offset < count, endIndex > 0 {
++            let end = boundaries[endIndex]
++            let start = boundaries[endIndex - 1]
++            endIndex -= 1
+             if offset > 0, end <= historyStart {
+-                continue
++                break
+             }
+             if usesHourly {
+                 let hours = self.hourly.filter { hour in
+@@ -354,10 +378,83 @@ public struct CostUsageTokenSnapshot: Sendable, Equatable {
+                     totalCostUSD: costs.isEmpty ? nil : costs.reduce(0, +),
+                     entryCount: entries.count))
+             }
++            offset += 1
+         }
+         return weeks
+     }
+ 
++    public static let quotaWeekBoundaryTolerance: TimeInterval = 2 * 60
++
++    /// Reconstructs quota-window edges from the live next reset plus any previously observed
++    /// Weekly `resetsAt` values or known reset instants.
++    public static func quotaWeekBoundaries(
++        liveNextReset: Date?,
++        observedNextResets: [Date],
++        observedResetInstants: [Date] = [],
++        windowMinutes: Int? = nil,
++        weekCount: Int = 4,
++        now: Date,
++        calendar: Calendar = .current) -> [Date]
++    {
++        let calendar = CostUsageLocalDay.gregorianCalendar(matching: calendar)
++        let duration = TimeInterval(self.normalizedQuotaWeekMinutes(windowMinutes) * 60)
++        let currentEnd = self.currentQuotaWeekEnd(
++            resetAt: liveNextReset,
++            duration: duration,
++            now: now,
++            calendar: calendar)
++        return self.quotaWeekBoundaries(
++            currentEnd: currentEnd,
++            duration: duration,
++            observedNextResets: observedNextResets,
++            observedResetInstants: observedResetInstants,
++            weekCount: max(1, min(weekCount, 8)))
++    }
++
++    private static func quotaWeekBoundaries(
++        currentEnd: Date,
++        duration: TimeInterval,
++        observedNextResets: [Date],
++        observedResetInstants: [Date],
++        weekCount: Int) -> [Date]
++    {
++        var dates: [Date] = [currentEnd, currentEnd.addingTimeInterval(-duration)]
++        dates.reserveCapacity(weekCount + 1 + observedNextResets.count * 2 + observedResetInstants.count)
++        for next in observedNextResets {
++            dates.append(next)
++            dates.append(next.addingTimeInterval(-duration))
++        }
++        dates.append(contentsOf: observedResetInstants)
++        let latestAllowed = currentEnd.addingTimeInterval(self.quotaWeekBoundaryTolerance)
++        var unique = self.uniqueSortedDates(dates, tolerance: self.quotaWeekBoundaryTolerance)
++            .filter { $0 <= latestAllowed }
++        if unique.last.map({ abs($0.timeIntervalSince(currentEnd)) < self.quotaWeekBoundaryTolerance }) != true {
++            unique.append(currentEnd)
++            unique = self.uniqueSortedDates(unique, tolerance: self.quotaWeekBoundaryTolerance)
++        }
++        let needed = weekCount + 1
++        var previousCount = -1
++        while unique.count < needed, duration > 0, unique.count != previousCount, let oldest = unique.first {
++            previousCount = unique.count
++            unique.insert(oldest.addingTimeInterval(-duration), at: 0)
++            unique = self.uniqueSortedDates(unique, tolerance: self.quotaWeekBoundaryTolerance)
++        }
++        return unique
++    }
++
++    private static func uniqueSortedDates(_ dates: [Date], tolerance: TimeInterval) -> [Date] {
++        let sorted = dates.sorted()
++        var unique: [Date] = []
++        unique.reserveCapacity(sorted.count)
++        for date in sorted {
++            if let last = unique.last, abs(date.timeIntervalSince(last)) < tolerance {
++                continue
++            }
++            unique.append(date)
++        }
++        return unique
++    }
++
+     public static func normalizedQuotaWeekMinutes(_ windowMinutes: Int?) -> Int {
+         let week = self.quotaWeekMinutes
+         guard let windowMinutes, (week - 24 * 60)...(week + 24 * 60) ~= windowMinutes else {
+diff --git a/TestsLinux/CostUsageQuotaWeekLinuxTests.swift b/TestsLinux/CostUsageQuotaWeekLinuxTests.swift
+index 08afb0890..71443a984 100644
+--- a/TestsLinux/CostUsageQuotaWeekLinuxTests.swift
++++ b/TestsLinux/CostUsageQuotaWeekLinuxTests.swift
+@@ -224,6 +224,53 @@ struct CostUsageQuotaWeekLinuxTests {
+         #expect(midnight?.totalTokens == 15)
+     }
+ 
++    @Test
++    func `observed official and banked resets on the same day become separate windows`() {
++        let now = Self.utcDate(year: 2026, month: 7, day: 17, hour: 12)
++        let official = Self.utcDate(year: 2026, month: 7, day: 16, hour: 15)
++        let banked = Self.utcDate(year: 2026, month: 7, day: 16, hour: 18)
++        let liveNext = Self.utcDate(year: 2026, month: 7, day: 23, hour: 18)
++        let snapshot = Self.snapshot(
++            historyDays: 30,
++            daily: [Self.entry(day: "2026-07-16", cost: 6, tokens: 600)],
++            hourly: [
++                CostUsageHourlyEntry(
++                    hour: Self.utcDate(year: 2026, month: 7, day: 16, hour: 14),
++                    totalTokens: 100,
++                    costUSD: 1),
++                CostUsageHourlyEntry(
++                    hour: Self.utcDate(year: 2026, month: 7, day: 16, hour: 16),
++                    totalTokens: 200,
++                    costUSD: 2),
++                CostUsageHourlyEntry(
++                    hour: Self.utcDate(year: 2026, month: 7, day: 16, hour: 19),
++                    totalTokens: 300,
++                    costUSD: 3),
++            ],
++            updatedAt: now)
++
++        let weeks = snapshot.quotaWeekSummaries(
++            resetAt: liveNext,
++            windowMinutes: CostUsageTokenSnapshot.quotaWeekMinutes,
++            observedNextResets: [official],
++            now: now,
++            calendar: Self.utcCalendar)
++        let current = weeks.first { $0.isCurrent }
++        let afterOfficial = weeks.first { $0.offset == 1 }
++        let beforeOfficial = weeks.first { $0.offset == 2 }
++
++        #expect(current?.start == banked)
++        #expect(current?.totalCostUSD == 3)
++        #expect(current?.isNominalWeek == true)
++        #expect(afterOfficial?.start == official)
++        #expect(afterOfficial?.end == banked)
++        #expect(afterOfficial?.totalCostUSD == 2)
++        #expect(afterOfficial?.isNominalWeek == false)
++        #expect(beforeOfficial?.end == official)
++        #expect(beforeOfficial?.totalCostUSD == 1)
++        #expect(beforeOfficial?.isNominalWeek == true)
++    }
++
+     private static func snapshot(
+         historyDays: Int,
+         daily: [CostUsageDailyReport.Entry],
+-- 
+2.43.0
+
