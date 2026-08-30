@@ -208,8 +208,28 @@ struct CostUsageCodexPreviousReport: Codable, Equatable {
         }
     }
 
+    struct HourlyEntry: Codable, Equatable {
+        var hourUnixMs: Int64
+        var totalTokens: Int?
+        var costUSD: Double?
+
+        init(_ entry: CostUsageHourlyEntry) {
+            self.hourUnixMs = Int64((entry.hour.timeIntervalSince1970 * 1000).rounded())
+            self.totalTokens = entry.totalTokens
+            self.costUSD = entry.costUSD
+        }
+
+        var hourlyValue: CostUsageHourlyEntry {
+            CostUsageHourlyEntry(
+                hour: Date(timeIntervalSince1970: Double(self.hourUnixMs) / 1000),
+                totalTokens: self.totalTokens,
+                costUSD: self.costUSD)
+        }
+    }
+
     var data: [Entry]
     var summary: Summary?
+    var hourly: [HourlyEntry]?
     var updatedAtUnixMs: Int64
     var scanSinceKey: String?
     var scanUntilKey: String?
@@ -225,6 +245,7 @@ struct CostUsageCodexPreviousReport: Codable, Equatable {
         guard !report.data.isEmpty else { return nil }
         self.data = report.data.map(Entry.init)
         self.summary = report.summary.map(Summary.init)
+        self.hourly = report.hourly.isEmpty ? nil : report.hourly.map(HourlyEntry.init)
         self.updatedAtUnixMs = cache.lastScanUnixMs
         self.scanSinceKey = reportSinceKey
         self.scanUntilKey = reportUntilKey
@@ -233,7 +254,10 @@ struct CostUsageCodexPreviousReport: Codable, Equatable {
     }
 
     var report: CostUsageDailyReport {
-        CostUsageDailyReport(data: self.data.map(\.dailyReportValue), summary: self.summary?.dailyReportValue)
+        CostUsageDailyReport(
+            data: self.data.map(\.dailyReportValue),
+            summary: self.summary?.dailyReportValue,
+            hourly: (self.hourly ?? []).map(\.hourlyValue))
     }
 
     var updatedAt: Date? {
@@ -252,7 +276,7 @@ struct CostUsageCodexPreviousReport: Codable, Equatable {
               let cachedSince = self.scanSinceKey,
               let cachedUntil = self.scanUntilKey
         else { return false }
-        return scanSinceKey >= cachedSince && scanUntilKey <= cachedUntil
+        return scanSinceKey >= cachedSince \u0026\u0026 scanUntilKey \u003c= cachedUntil
     }
 }
 
@@ -327,8 +351,8 @@ struct CostUsageCodexSessionMetadata: Codable, Equatable {
     var latestActivityUnixMs: Int64?
 
     var isEmpty: Bool {
-        self.sessionId == nil && self.forkedFromId == nil && self.cwd == nil && self.title == nil
-            && self.startedAtUnixMs == nil && self.latestActivityUnixMs == nil
+        self.sessionId == nil \u0026\u0026 self.forkedFromId == nil \u0026\u0026 self.cwd == nil \u0026\u0026 self.title == nil
+            \u0026\u0026 self.startedAtUnixMs == nil \u0026\u0026 self.latestActivityUnixMs == nil
     }
 
     func merging(_ newer: CostUsageCodexSessionMetadata) -> CostUsageCodexSessionMetadata {
