@@ -92,7 +92,7 @@ extension StatusItemController {
 
         let sourceLabel = sourceLabelOverride ?? (surface == .liveCard ? self.store.sourceLabel(for: target) : nil)
         // Provider-specific by design: Kilo's automatic source mode is surfaced as card fallback context.
-        let kiloAutoMode = target == .kilo && self.settings.kiloUsageDataSource == .auto
+        let kiloAutoMode = target == .kilo \u0026\u0026 self.settings.kiloUsageDataSource == .auto
         let (weeklyPace, sessionEquivalentForecast) = self.resolvePaceAndForecast(
             target: target,
             snapshot: snapshot,
@@ -141,7 +141,7 @@ extension StatusItemController {
             // do with whether this row should show, silently disabling the Cost row for those
             // providers too (e.g. groq's addition to the inline-dashboard set previously did this).
             tokenCostMenuSectionEnabled: ProviderDescriptorRegistry.descriptor(for: target).tokenCost
-                .showsCostMenuSection &&
+                .showsCostMenuSection \u0026\u0026
                 self.settings.costSummaryShowsSubmenu(for: target),
             costComparisonPeriodsEnabled: self.settings.costComparisonPeriodsEnabled,
             showOptionalCreditsAndExtraUsage: self.settings.showOptionalCreditsAndExtraUsage,
@@ -164,7 +164,12 @@ extension StatusItemController {
             usesLiveSubtitle: surface == .liveCard,
             preferredCurrencyCode: self.settings.preferredCurrencyCode,
             costUsageBucketCalendar: self.settings.costUsageBucketCalendar,
-            now: now)
+            now: now,
+            observedWeeklyNextResets: self.observedWeeklyNextResets(
+                for: target,
+                snapshot: snapshot,
+                historySelection: historySelectionOverride,
+                usesOverrideCard: surface == .overrideCard))
         return UsageMenuCardView.Model.make(input)
     }
 
@@ -275,6 +280,25 @@ extension StatusItemController {
 
     func accountInfo(for account: CodexVisibleAccount) -> AccountInfo {
         AccountInfo(email: account.email, plan: account.workspaceLabel)
+    }
+
+    private func observedWeeklyNextResets(
+        for provider: UsageProvider,
+        snapshot: UsageSnapshot?,
+        historySelection: PlanUtilizationHistorySelection?,
+        usesOverrideCard: Bool) -> [Date]
+    {
+        let selection: PlanUtilizationHistorySelection
+        if let historySelection {
+            selection = historySelection
+        } else if usesOverrideCard, let snapshot {
+            selection = self.store.planUtilizationHistorySelection(for: provider, snapshotOverride: snapshot)
+        } else {
+            selection = self.store.planUtilizationHistorySelection(for: provider)
+        }
+        return selection.histories
+            .first { $0.name == .weekly }?
+            .entries.compactMap(\.resetsAt) ?? []
     }
 
     private func quotaWarningMarkerThresholds(provider: UsageProvider, window: QuotaWarningWindow) -> [Int] {
