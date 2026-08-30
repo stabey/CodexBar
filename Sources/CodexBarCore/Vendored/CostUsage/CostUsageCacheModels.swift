@@ -276,7 +276,7 @@ struct CostUsageCodexPreviousReport: Codable, Equatable {
               let cachedSince = self.scanSinceKey,
               let cachedUntil = self.scanUntilKey
         else { return false }
-        return scanSinceKey >= cachedSince \u0026\u0026 scanUntilKey \u003c= cachedUntil
+        return scanSinceKey >= cachedSince && scanUntilKey <= cachedUntil
     }
 }
 
@@ -351,8 +351,8 @@ struct CostUsageCodexSessionMetadata: Codable, Equatable {
     var latestActivityUnixMs: Int64?
 
     var isEmpty: Bool {
-        self.sessionId == nil \u0026\u0026 self.forkedFromId == nil \u0026\u0026 self.cwd == nil \u0026\u0026 self.title == nil
-            \u0026\u0026 self.startedAtUnixMs == nil \u0026\u0026 self.latestActivityUnixMs == nil
+        self.sessionId == nil && self.forkedFromId == nil && self.cwd == nil && self.title == nil
+            && self.startedAtUnixMs == nil && self.latestActivityUnixMs == nil
     }
 
     func merging(_ newer: CostUsageCodexSessionMetadata) -> CostUsageCodexSessionMetadata {
