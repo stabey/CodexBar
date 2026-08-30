@@ -1,0 +1,896 @@
+From eed653372a5d14392d370125e404e0c9af4bfa33 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sun, 30 Aug 2026 04:27:35 +0000
+Subject: [PATCH 2/4] Split weekly quota cost at the reset instant
+
+Codex and Claude now bucket local requests into hours, so This week
+and Last week split a mid-day Weekly reset instead of counting the
+same calendar day twice. Daily-only history falls back to exclusive
+day membership until hourly data is available.
+
+Co-authored-by: stabeyzhou <stabeyzhou@gmail.com>
+---
+ CHANGELOG.md                                  |   2 +-
+ Sources/CodexBarCore/CostUsageFetcher.swift   |   7 +-
+ Sources/CodexBarCore/CostUsageModels.swift    | 145 ++++++++++++---
+ .../CostUsage/CostUsageCacheModels.swift      |  26 ++-
+ .../CostUsageScanner+CacheHelpers.swift       |  98 +++++++++-
+ .../CostUsage/CostUsageScanner+Claude.swift   |  36 +++-
+ .../OpenCodexUsage/OpenCodexUsageFanOut.swift |   6 +-
+ .../CostUsageHourlyReportLinuxTests.swift     | 169 ++++++++++++++++++
+ TestsLinux/CostUsageQuotaWeekLinuxTests.swift | 129 +++++++++++++
+ 9 files changed, 581 insertions(+), 37 deletions(-)
+ create mode 100644 TestsLinux/CostUsageHourlyReportLinuxTests.swift
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 11d715cd7..011e684ff 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,7 +3,7 @@
+ ## 0.56.1 — Unreleased
+ 
+ ### Added
+-- Codex and Claude: show this week's local cost and tokens next to Today, aligned to the live Weekly reset when known, with compact Last week / 2–3 weeks ago totals under the daily chart.
++- Codex and Claude: show this week's local cost and tokens next to Today, split at the live Weekly reset instant rather than double-counting the reset calendar day, with compact Last week / 2–3 weeks ago totals under the daily chart.
+ 
+ ### Fixed
+ - Antigravity: reuse a running `agy` by its verified executable path even when its command line uses a bare name, and preserve CLI sign-in guidance when an IDE fallback has no CSRF token (follow-up to #3146). Thanks @haixing23!
+diff --git a/Sources/CodexBarCore/CostUsageFetcher.swift b/Sources/CodexBarCore/CostUsageFetcher.swift
+index 2e45a2094..129a76001 100644
+--- a/Sources/CodexBarCore/CostUsageFetcher.swift
++++ b/Sources/CodexBarCore/CostUsageFetcher.swift
+@@ -643,7 +643,9 @@ public struct CostUsageFetcher: Sendable {
+                 if provider == .codex {
+                     piDaily = piReport
+                 }
+-                daily = CostUsageDailyReport.merged([daily, piReport])
++                daily = CostUsageDailyReport.merged(
++                    [daily, piReport],
++                    calendar: options.scanOptions.calendar)
+             }
+             if provider == .codex {
+                 projects = Self.mergedProjectBreakdowns(
+@@ -994,7 +996,7 @@ public struct CostUsageFetcher: Sendable {
+             // rescan on the strength of another source's scan.
+             return CachedCodexTokenSnapshotResult(
+                 snapshot: Self.tokenSnapshot(
+-                    from: CostUsageDailyReport.merged(reports),
++                    from: CostUsageDailyReport.merged(reports, calendar: options.calendar),
+                     now: now,
+                     historyDays: clampedHistoryDays,
+                     calendar: options.calendar,
+@@ -1324,6 +1326,7 @@ public struct CostUsageFetcher: Sendable {
+             daily: daily.data,
+             projects: projects,
+             sessions: sessions,
++            hourly: daily.hourly,
+             updatedAt: updatedAt ?? now)
+     }
+ 
+diff --git a/Sources/CodexBarCore/CostUsageModels.swift b/Sources/CodexBarCore/CostUsageModels.swift
+index e408df341..0e376e93f 100644
+--- a/Sources/CodexBarCore/CostUsageModels.swift
++++ b/Sources/CodexBarCore/CostUsageModels.swift
+@@ -50,11 +50,12 @@ public struct CostUsageWindowSummary: Sendable, Equatable {
+     }
+ }
+ 
+-/// A 7-day quota window derived from local daily cost history.
++/// A 7-day quota window derived from local cost history.
+ ///
+ /// When `resetAt` is known, windows line up with the live Weekly bar rather than a rolling
+-/// calendar "last 7 days". Daily logs cannot split a mid-day reset, so a boundary day is
+-/// counted in every window it overlaps.
++/// calendar "last 7 days". Hour buckets split a reset day at the reset instant; each hour
++/// belongs to exactly one window. Daily-only snapshots fall back to exclusive day membership
++/// so a boundary calendar day is never counted twice.
+ public struct CostUsageQuotaWeek: Sendable, Equatable {
+     public let offset: Int
+     public let start: Date
+@@ -163,7 +164,8 @@ public struct CostUsageTokenSnapshot: Sendable, Equatable {
+     public let daily: [CostUsageDailyReport.Entry]
+     public let projects: [CostUsageProjectBreakdown]
+     public let sessions: [CostUsageSessionBreakdown]
+-    /// Per-request hour buckets. Empty for native Codex/Claude day logs; OpenCodex fills this.
++    /// Per-request hour buckets. Native Codex/Claude fill this from event timestamps so weekly
++    /// quota windows can split a mid-day reset; OpenCodex fills it from usage.jsonl.
+     public let hourly: [CostUsageHourlyEntry]
+     public let updatedAt: Date
+ 
+@@ -280,10 +282,12 @@ public struct CostUsageTokenSnapshot: Sendable, Equatable {
+ 
+     public static let quotaWeekMinutes = 7 * 24 * 60
+ 
+-    /// Buckets daily cost rows into consecutive 7-day windows.
++    /// Buckets local cost into consecutive 7-day windows.
+     ///
+     /// Pass the live Weekly `resetsAt` / `windowMinutes` to match the quota bar. When reset
+     /// metadata is missing, windows fall back to rolling calendar weeks ending tomorrow.
++    /// Hour entries use half-open `[start, end)` membership so a reset-day hour is never
++    /// counted in two weeks. Daily-only history uses the day's start instant the same way.
+     public func quotaWeekSummaries(
+         resetAt: Date?,
+         windowMinutes: Int? = nil,
+@@ -303,13 +307,14 @@ public struct CostUsageTokenSnapshot: Sendable, Equatable {
+             byAdding: .day,
+             value: -(max(1, self.historyDays) - 1),
+             to: calendar.startOfDay(for: self.updatedAt)) ?? self.updatedAt
+-        let indexedDays: [(start: Date, end: Date, entry: CostUsageDailyReport.Entry)] = self.daily
+-            .compactMap { entry in
++        let usesHourly = !self.hourly.isEmpty
++        let indexedDays: [(start: Date, entry: CostUsageDailyReport.Entry)] = usesHourly
++            ? []
++            : self.daily.compactMap { entry in
+                 guard let dayKey = Self.localDayKey(for: entry.date, calendar: calendar),
+-                      let dayStart = CostUsageLocalDay.date(fromKey: dayKey, calendar: calendar),
+-                      let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart)
++                      let dayStart = CostUsageLocalDay.date(fromKey: dayKey, calendar: calendar)
+                 else { return nil }
+-                return (dayStart, dayEnd, entry)
++                return (dayStart, entry)
+             }
+ 
+         let count = max(1, min(weekCount, 8))
+@@ -321,19 +326,34 @@ public struct CostUsageTokenSnapshot: Sendable, Equatable {
+             if offset > 0, end <= historyStart {
+                 continue
+             }
+-            let entries = indexedDays.compactMap { day -> CostUsageDailyReport.Entry? in
+-                guard day.start < end, day.end > start else { return nil }
+-                return day.entry
++            if usesHourly {
++                let hours = self.hourly.filter { hour in
++                    hour.hour >= start && hour.hour < end
++                }
++                let costs = hours.compactMap(\.costUSD)
++                let tokens = hours.compactMap(\.totalTokens)
++                weeks.append(CostUsageQuotaWeek(
++                    offset: offset,
++                    start: start,
++                    end: end,
++                    totalTokens: Self.summedInts(tokens),
++                    totalCostUSD: costs.isEmpty ? nil : costs.reduce(0, +),
++                    entryCount: hours.count))
++            } else {
++                let entries = indexedDays.compactMap { day -> CostUsageDailyReport.Entry? in
++                    guard day.start >= start, day.start < end else { return nil }
++                    return day.entry
++                }
++                let costs = entries.compactMap(\.costUSD)
++                let tokens = entries.compactMap(\.totalTokens)
++                weeks.append(CostUsageQuotaWeek(
++                    offset: offset,
++                    start: start,
++                    end: end,
++                    totalTokens: Self.summedInts(tokens),
++                    totalCostUSD: costs.isEmpty ? nil : costs.reduce(0, +),
++                    entryCount: entries.count))
+             }
+-            let costs = entries.compactMap(\.costUSD)
+-            let tokens = entries.compactMap(\.totalTokens)
+-            weeks.append(CostUsageQuotaWeek(
+-                offset: offset,
+-                start: start,
+-                end: end,
+-                totalTokens: Self.summedInts(tokens),
+-                totalCostUSD: costs.isEmpty ? nil : costs.reduce(0, +),
+-                entryCount: entries.count))
+         }
+         return weeks
+     }
+@@ -815,6 +835,7 @@ public struct CostUsageDailyReport: Sendable, Decodable {
+ 
+     public let data: [Entry]
+     public let summary: Summary?
++    public let hourly: [CostUsageHourlyEntry]
+ 
+     private enum CodingKeys: String, CodingKey {
+         case type
+@@ -826,6 +847,7 @@ public struct CostUsageDailyReport: Sendable, Decodable {
+ 
+     public init(from decoder: Decoder) throws {
+         let container = try decoder.container(keyedBy: CodingKeys.self)
++        self.hourly = []
+ 
+         if container.contains(.type) {
+             _ = try container.decode(String.self, forKey: .type)
+@@ -849,9 +871,10 @@ public struct CostUsageDailyReport: Sendable, Decodable {
+         }
+     }
+ 
+-    public init(data: [Entry], summary: Summary?) {
++    public init(data: [Entry], summary: Summary?, hourly: [CostUsageHourlyEntry] = []) {
+         self.data = data
+         self.summary = summary
++        self.hourly = hourly
+     }
+ }
+ 
+@@ -1004,14 +1027,82 @@ extension CostUsageDailyReport {
+         }
+     }
+ 
+-    public func merged(with other: CostUsageDailyReport) -> CostUsageDailyReport {
+-        Self.merged([self, other])
++    public func merged(with other: CostUsageDailyReport, calendar: Calendar = .current) -> CostUsageDailyReport {
++        Self.merged([self, other], calendar: calendar)
+     }
+ 
+-    public static func merged(_ reports: [CostUsageDailyReport]) -> CostUsageDailyReport {
++    public static func merged(
++        _ reports: [CostUsageDailyReport],
++        calendar: Calendar = .current) -> CostUsageDailyReport
++    {
+         let entries = self.mergedEntries(from: reports)
+         guard !entries.isEmpty else { return CostUsageDailyReport(data: [], summary: nil) }
+-        return CostUsageDailyReport(data: entries, summary: self.mergedSummary(from: entries))
++        return CostUsageDailyReport(
++            data: entries,
++            summary: self.mergedSummary(from: entries),
++            hourly: self.mergedHourly(from: reports, calendar: calendar))
++    }
++
++    private struct HourlyAccumulator {
++        var totalTokens = 0
++        var sawTokens = false
++        var costUSD = 0.0
++        var sawCost = false
++
++        mutating func add(_ entry: CostUsageHourlyEntry) {
++            if let tokens = entry.totalTokens {
++                self.totalTokens += tokens
++                self.sawTokens = true
++            }
++            if let costUSD = entry.costUSD {
++                self.costUSD += costUSD
++                self.sawCost = true
++            }
++        }
++
++        func build(hour: Date) -> CostUsageHourlyEntry {
++            CostUsageHourlyEntry(
++                hour: hour,
++                totalTokens: self.sawTokens ? self.totalTokens : nil,
++                costUSD: self.sawCost ? self.costUSD : nil)
++        }
++    }
++
++    private static func mergedHourly(
++        from reports: [CostUsageDailyReport],
++        calendar: Calendar) -> [CostUsageHourlyEntry]
++    {
++        let hasHourly = reports.contains { !$0.hourly.isEmpty }
++        guard hasHourly else { return [] }
++        var buckets: [Date: HourlyAccumulator] = [:]
++        for report in reports {
++            let hours = report.hourly.isEmpty
++                ? self.synthesizedHourly(from: report.data, calendar: calendar)
++                : report.hourly
++            for entry in hours {
++                var accumulator = buckets[entry.hour] ?? HourlyAccumulator()
++                accumulator.add(entry)
++                buckets[entry.hour] = accumulator
++            }
++        }
++        return buckets.keys.sorted().map { hour in
++            buckets[hour, default: HourlyAccumulator()].build(hour: hour)
++        }
++    }
++
++    private static func synthesizedHourly(
++        from entries: [Entry],
++        calendar: Calendar) -> [CostUsageHourlyEntry]
++    {
++        entries.compactMap { entry in
++            guard entry.costUSD != nil || entry.totalTokens != nil,
++                  let dayStart = CostUsageLocalDay.date(fromKey: entry.date, calendar: calendar)
++            else { return nil }
++            return CostUsageHourlyEntry(
++                hour: dayStart,
++                totalTokens: entry.totalTokens,
++                costUSD: entry.costUSD)
++        }
+     }
+ 
+     private static func mergedEntries(from reports: [CostUsageDailyReport]) -> [Entry] {
+diff --git a/Sources/CodexBarCore/Vendored/CostUsage/CostUsageCacheModels.swift b/Sources/CodexBarCore/Vendored/CostUsage/CostUsageCacheModels.swift
+index 5fd1caa17..91bd7b1cc 100644
+--- a/Sources/CodexBarCore/Vendored/CostUsage/CostUsageCacheModels.swift
++++ b/Sources/CodexBarCore/Vendored/CostUsage/CostUsageCacheModels.swift
+@@ -208,8 +208,28 @@ struct CostUsageCodexPreviousReport: Codable, Equatable {
+         }
+     }
+ 
++    struct HourlyEntry: Codable, Equatable {
++        var hourUnixMs: Int64
++        var totalTokens: Int?
++        var costUSD: Double?
++
++        init(_ entry: CostUsageHourlyEntry) {
++            self.hourUnixMs = Int64((entry.hour.timeIntervalSince1970 * 1000).rounded())
++            self.totalTokens = entry.totalTokens
++            self.costUSD = entry.costUSD
++        }
++
++        var hourlyValue: CostUsageHourlyEntry {
++            CostUsageHourlyEntry(
++                hour: Date(timeIntervalSince1970: Double(self.hourUnixMs) / 1000),
++                totalTokens: self.totalTokens,
++                costUSD: self.costUSD)
++        }
++    }
++
+     var data: [Entry]
+     var summary: Summary?
++    var hourly: [HourlyEntry]?
+     var updatedAtUnixMs: Int64
+     var scanSinceKey: String?
+     var scanUntilKey: String?
+@@ -225,6 +245,7 @@ struct CostUsageCodexPreviousReport: Codable, Equatable {
+         guard !report.data.isEmpty else { return nil }
+         self.data = report.data.map(Entry.init)
+         self.summary = report.summary.map(Summary.init)
++        self.hourly = report.hourly.isEmpty ? nil : report.hourly.map(HourlyEntry.init)
+         self.updatedAtUnixMs = cache.lastScanUnixMs
+         self.scanSinceKey = reportSinceKey
+         self.scanUntilKey = reportUntilKey
+@@ -233,7 +254,10 @@ struct CostUsageCodexPreviousReport: Codable, Equatable {
+     }
+ 
+     var report: CostUsageDailyReport {
+-        CostUsageDailyReport(data: self.data.map(\.dailyReportValue), summary: self.summary?.dailyReportValue)
++        CostUsageDailyReport(
++            data: self.data.map(\.dailyReportValue),
++            summary: self.summary?.dailyReportValue,
++            hourly: (self.hourly ?? []).map(\.hourlyValue))
+     }
+ 
+     var updatedAt: Date? {
+diff --git a/Sources/CodexBarCore/Vendored/CostUsage/CostUsageScanner+CacheHelpers.swift b/Sources/CodexBarCore/Vendored/CostUsage/CostUsageScanner+CacheHelpers.swift
+index bdcd5dc37..282827bf6 100644
+--- a/Sources/CodexBarCore/Vendored/CostUsage/CostUsageScanner+CacheHelpers.swift
++++ b/Sources/CodexBarCore/Vendored/CostUsage/CostUsageScanner+CacheHelpers.swift
+@@ -1382,6 +1382,91 @@ extension CostUsageScanner {
+         return out
+     }
+ 
++    struct HourlyBucket {
++        var totalTokens = 0
++        var sawTokens = false
++        var costUSD = 0.0
++        var sawCost = false
++
++        mutating func add(tokens: Int, costUSD: Double?) {
++            if tokens != 0 {
++                self.totalTokens += tokens
++                self.sawTokens = true
++            }
++            if let costUSD {
++                self.costUSD += costUSD
++                self.sawCost = true
++            }
++        }
++
++        func entry(hour: Date) -> CostUsageHourlyEntry {
++            CostUsageHourlyEntry(
++                hour: hour,
++                totalTokens: self.sawTokens ? self.totalTokens : nil,
++                costUSD: self.sawCost ? self.costUSD : nil)
++        }
++    }
++
++    static func hourStart(for timestamp: Date, calendar: Calendar) -> Date {
++        calendar.dateInterval(of: .hour, for: timestamp)?.start ?? timestamp
++    }
++
++    static func date(fromUnixMs millis: Int64?) -> Date? {
++        millis.map { Date(timeIntervalSince1970: Double($0) / 1000) }
++    }
++
++    static func sortedHourlyEntries(_ buckets: [Date: HourlyBucket]) -> [CostUsageHourlyEntry] {
++        buckets.keys.sorted().map { hour in
++            (buckets[hour] ?? HourlyBucket()).entry(hour: hour)
++        }
++    }
++
++    static func addCodexHourly(
++        rows: [CodexUsageRow],
++        billedCostUSD: Double?,
++        calendar: Calendar,
++        into buckets: inout [Date: HourlyBucket])
++    {
++        struct Share {
++            let hour: Date
++            let tokens: Int
++        }
++
++        var shares: [Share] = []
++        var tokenTotal = 0
++        for row in rows {
++            let tokens = max(0, row.input) + max(0, row.output)
++            let timestamp = self.date(fromUnixMs: row.timestampUnixMs)
++                ?? CostUsageLocalDay.date(fromKey: row.day, calendar: calendar)
++            guard let timestamp else { continue }
++            let hour = self.hourStart(for: timestamp, calendar: calendar)
++            shares.append(Share(hour: hour, tokens: tokens))
++            tokenTotal += tokens
++            var bucket = buckets[hour] ?? HourlyBucket()
++            bucket.add(tokens: tokens, costUSD: nil)
++            buckets[hour] = bucket
++        }
++        guard let billedCostUSD, !shares.isEmpty else { return }
++        if tokenTotal <= 0 {
++            let hour = shares[0].hour
++            var bucket = buckets[hour] ?? HourlyBucket()
++            bucket.add(tokens: 0, costUSD: billedCostUSD)
++            buckets[hour] = bucket
++            return
++        }
++        var remaining = billedCostUSD
++        for index in shares.indices {
++            let share = shares[index]
++            let portion = index == shares.indices.last
++                ? remaining
++                : billedCostUSD * Double(share.tokens) / Double(tokenTotal)
++            var bucket = buckets[share.hour] ?? HourlyBucket()
++            bucket.add(tokens: 0, costUSD: portion)
++            buckets[share.hour] = bucket
++            remaining -= portion
++        }
++    }
++
+     static func buildCodexReportFromCache(
+         cache: CostUsageCache,
+         range: CostUsageDayRange,
+@@ -1403,6 +1488,7 @@ extension CostUsageScanner {
+                 priorityTurns: priorityTurns)
+         }
+         var entries: [CostUsageDailyReport.Entry] = []
++        var hourlyBuckets: [Date: HourlyBucket] = [:]
+         var (totalInput, totalCacheRead, totalOutput, totalReasoning, totalTokens) = (0, 0, 0, 0, 0)
+         var (totalCost, costSeen) = (0.0, false)
+ 
+@@ -1470,6 +1556,13 @@ extension CostUsageScanner {
+                 pricing: pricing)
+             else { continue }
+             entries.append(entry)
++            for breakdown in entry.modelBreakdowns ?? [] {
++                Self.addCodexHourly(
++                    rows: pricing.rowsByDayModel[day]?[breakdown.modelName] ?? [],
++                    billedCostUSD: breakdown.costUSD,
++                    calendar: range.calendar,
++                    into: &hourlyBuckets)
++            }
+             totalInput += entry.inputTokens ?? 0
+             totalCacheRead += entry.cacheReadTokens ?? 0
+             totalOutput += entry.outputTokens ?? 0
+@@ -1491,7 +1584,10 @@ extension CostUsageScanner {
+                 totalTokens: totalTokens,
+                 totalCostUSD: costSeen ? totalCost : nil)
+ 
+-        return CostUsageDailyReport(data: entries, summary: summary)
++        return CostUsageDailyReport(
++            data: entries,
++            summary: summary,
++            hourly: self.sortedHourlyEntries(hourlyBuckets))
+     }
+ 
+     static func sortedModelBreakdowns(_ breakdowns: [CostUsageDailyReport.ModelBreakdown])
+diff --git a/Sources/CodexBarCore/Vendored/CostUsage/CostUsageScanner+Claude.swift b/Sources/CodexBarCore/Vendored/CostUsage/CostUsageScanner+Claude.swift
+index bf17734c8..ebb6ed116 100644
+--- a/Sources/CodexBarCore/Vendored/CostUsage/CostUsageScanner+Claude.swift
++++ b/Sources/CodexBarCore/Vendored/CostUsage/CostUsageScanner+Claude.swift
+@@ -873,13 +873,27 @@ extension CostUsageScanner {
+             pricingArtifactStamp: artifactStamps.pricing)
+     }
+ 
+-    private static func buildClaudeReportFromCache(
++    static func buildClaudeReportFromCache(
++        cache: CostUsageCache,
++        range: CostUsageDayRange,
++        now: Date = Date(),
++        modelsDevCacheRoot: URL? = nil) -> CostUsageDailyReport
++    {
++        self.buildClaudeReportFromCache(
++            cache: cache,
++            range: range,
++            modelsDevCatalogResolver: ClaudeModelsDevCatalogResolver(now: now, cacheRoot: modelsDevCacheRoot),
++            modelsDevCacheRoot: modelsDevCacheRoot)
++    }
++
++    static func buildClaudeReportFromCache(
+         cache: CostUsageCache,
+         range: CostUsageDayRange,
+         modelsDevCatalogResolver: ClaudeModelsDevCatalogResolver,
+         modelsDevCacheRoot: URL? = nil) -> CostUsageDailyReport
+     {
+         var entries: [CostUsageDailyReport.Entry] = []
++        var hourlyBuckets: [Date: HourlyBucket] = [:]
+         var totalInput = 0
+         var totalOutput = 0
+         var totalCacheRead = 0
+@@ -927,6 +941,21 @@ extension CostUsageScanner {
+                 aggregate.unresolved = true
+             }
+             repricedCosts[key] = aggregate
++
++            guard CostUsageDayRange.isInRange(
++                dayKey: row.dayKey,
++                since: range.sinceKey,
++                until: range.untilKey)
++            else { continue }
++            let timestamp = self.date(fromUnixMs: row.timestampUnixMs)
++                ?? CostUsageLocalDay.date(fromKey: row.dayKey, calendar: range.calendar)
++            guard let timestamp else { continue }
++            let hour = self.hourStart(for: timestamp, calendar: range.calendar)
++            var bucket = hourlyBuckets[hour] ?? HourlyBucket()
++            bucket.add(
++                tokens: row.input + row.cacheRead + row.cacheCreate + row.output,
++                costUSD: cost)
++            hourlyBuckets[hour] = bucket
+         }
+ 
+         let dayKeys = cache.days.keys.sorted().filter {
+@@ -1018,6 +1047,9 @@ extension CostUsageScanner {
+                 totalTokens: totalTokens,
+                 totalCostUSD: costSeen ? totalCost : nil)
+ 
+-        return CostUsageDailyReport(data: entries, summary: summary)
++        return CostUsageDailyReport(
++            data: entries,
++            summary: summary,
++            hourly: self.sortedHourlyEntries(hourlyBuckets))
+     }
+ }
+diff --git a/Sources/CodexBarCore/Vendored/OpenCodexUsage/OpenCodexUsageFanOut.swift b/Sources/CodexBarCore/Vendored/OpenCodexUsage/OpenCodexUsageFanOut.swift
+index a060ff8df..4efa72719 100644
+--- a/Sources/CodexBarCore/Vendored/OpenCodexUsage/OpenCodexUsageFanOut.swift
++++ b/Sources/CodexBarCore/Vendored/OpenCodexUsage/OpenCodexUsageFanOut.swift
+@@ -44,9 +44,9 @@ public enum OpenCodexUsageFanOut {
+         calendar: Calendar) -> CostUsageTokenSnapshot
+     {
+         let mergedReport = CostUsageDailyReport.merged([
+-            CostUsageDailyReport(data: base.daily, summary: nil),
+-            CostUsageDailyReport(data: supplement.daily, summary: nil),
+-        ])
++            CostUsageDailyReport(data: base.daily, summary: nil, hourly: base.hourly),
++            CostUsageDailyReport(data: supplement.daily, summary: nil, hourly: supplement.hourly),
++        ], calendar: calendar)
+         var sessions = base.sessions
+         var sessionIDs = Set(sessions.map(\.id))
+         for session in supplement.sessions where sessionIDs.insert(session.id).inserted {
+diff --git a/TestsLinux/CostUsageHourlyReportLinuxTests.swift b/TestsLinux/CostUsageHourlyReportLinuxTests.swift
+new file mode 100644
+index 000000000..e3cd7c59b
+--- /dev/null
++++ b/TestsLinux/CostUsageHourlyReportLinuxTests.swift
+@@ -0,0 +1,169 @@
++import Foundation
++import Testing
++@testable import CodexBarCore
++
++struct CostUsageHourlyReportLinuxTests {
++    @Test
++    func `codex report splits billed cost across hours on the reset day`() {
++        let calendar = Self.utcCalendar
++        let day = Self.utcDate(year: 2026, month: 7, day: 11, hour: 12)
++        let range = CostUsageScanner.CostUsageDayRange(since: day, until: day, calendar: calendar)
++        let dayKey = range.sinceKey
++        let model = "gpt-5.4"
++        let before = Self.utcDate(year: 2026, month: 7, day: 11, hour: 14)
++        let after = Self.utcDate(year: 2026, month: 7, day: 11, hour: 15)
++        let beforeRow = CostUsageScanner.CodexUsageRow(
++            day: dayKey,
++            model: model,
++            turnID: "before",
++            eventIndex: 0,
++            timestampUnixMs: Int64(before.timeIntervalSince1970 * 1000),
++            input: 100,
++            cached: 0,
++            output: 0,
++            knownCostNanos: 2_000_000_000,
++            pricingMode: "standard")
++        let afterRow = CostUsageScanner.CodexUsageRow(
++            day: dayKey,
++            model: model,
++            turnID: "after",
++            eventIndex: 1,
++            timestampUnixMs: Int64(after.timeIntervalSince1970 * 1000),
++            input: 200,
++            cached: 0,
++            output: 0,
++            knownCostNanos: 4_000_000_000,
++            pricingMode: "standard")
++        let usage = CostUsageScanner.makeFileUsage(
++            mtimeUnixMs: afterRow.timestampUnixMs ?? 0,
++            size: 1,
++            days: [dayKey: [model: [300, 0, 0]]],
++            parsedBytes: 1,
++            sessionId: "session",
++            codexRows: [beforeRow, afterRow],
++            codexScanComplete: true)
++        var cache = CostUsageCache()
++        cache.files = ["/session.jsonl": usage]
++        cache.days = [dayKey: [model: [300, 0, 0]]]
++        cache.scanSinceKey = dayKey
++        cache.scanUntilKey = dayKey
++        cache.timeZoneIdentifier = calendar.timeZone.identifier
++
++        let report = CostUsageScanner.buildCodexReportFromCache(cache: cache, range: range)
++        #expect(report.data.first?.costUSD == 6)
++        #expect(report.hourly.count == 2)
++        let beforeHour = report.hourly.first { $0.hour == calendar.dateInterval(of: .hour, for: before)?.start }
++        let afterHour = report.hourly.first { $0.hour == calendar.dateInterval(of: .hour, for: after)?.start }
++        #expect(beforeHour?.costUSD == 2)
++        #expect(beforeHour?.totalTokens == 100)
++        #expect(afterHour?.costUSD == 4)
++        #expect(afterHour?.totalTokens == 200)
++
++        let snapshot = CostUsageFetcher.tokenSnapshot(
++            from: report,
++            now: after,
++            historyDays: 30,
++            calendar: calendar)
++        #expect(snapshot.hourly == report.hourly)
++        let weeks = snapshot.quotaWeekSummaries(
++            resetAt: after,
++            windowMinutes: CostUsageTokenSnapshot.quotaWeekMinutes,
++            calendar: calendar)
++        #expect(weeks.first { $0.isCurrent }?.totalCostUSD == 4)
++        #expect(weeks.first { $0.offset == 1 }?.totalCostUSD == 2)
++    }
++
++    @Test
++    func `claude report assigns request cost to the hour it happened`() {
++        let calendar = Self.utcCalendar
++        let day = Self.utcDate(year: 2026, month: 7, day: 11, hour: 12)
++        let range = CostUsageScanner.CostUsageDayRange(since: day, until: day, calendar: calendar)
++        let dayKey = range.sinceKey
++        let model = "claude-opus-4"
++        let before = Self.utcDate(year: 2026, month: 7, day: 11, hour: 14)
++        let after = Self.utcDate(year: 2026, month: 7, day: 11, hour: 15)
++        let beforeRow = CostUsageScanner.ClaudeUsageRow(
++            dayKey: dayKey,
++            model: model,
++            sessionId: "s",
++            messageId: "m1",
++            requestId: "r1",
++            timestampUnixMs: Int64(before.timeIntervalSince1970 * 1000),
++            isSidechain: false,
++            pathRole: .parent,
++            input: 50,
++            cacheRead: 0,
++            cacheCreate: 0,
++            cacheCreate1h: nil,
++            output: 10,
++            costNanos: 1_500_000_000,
++            costPriced: true)
++        let afterRow = CostUsageScanner.ClaudeUsageRow(
++            dayKey: dayKey,
++            model: model,
++            sessionId: "s",
++            messageId: "m2",
++            requestId: "r2",
++            timestampUnixMs: Int64(after.timeIntervalSince1970 * 1000),
++            isSidechain: false,
++            pathRole: .parent,
++            input: 80,
++            cacheRead: 0,
++            cacheCreate: 0,
++            cacheCreate1h: nil,
++            output: 20,
++            costNanos: 3_500_000_000,
++            costPriced: true)
++        let usage = CostUsageScanner.makeFileUsage(
++            mtimeUnixMs: afterRow.timestampUnixMs ?? 0,
++            size: 1,
++            days: [:],
++            parsedBytes: 1,
++            claudeRows: [beforeRow, afterRow])
++        var cache = CostUsageCache()
++        cache.files = ["/claude.jsonl": usage]
++        cache.days = [dayKey: [model: [130, 0, 0, 30, 5_000_000_000, 2, 2, 0]]]
++        cache.scanSinceKey = dayKey
++        cache.scanUntilKey = dayKey
++        cache.timeZoneIdentifier = calendar.timeZone.identifier
++
++        let report = CostUsageScanner.buildClaudeReportFromCache(cache: cache, range: range)
++        let beforeHour = report.hourly.first { $0.hour == calendar.dateInterval(of: .hour, for: before)?.start }
++        let afterHour = report.hourly.first { $0.hour == calendar.dateInterval(of: .hour, for: after)?.start }
++        #expect(beforeHour?.totalTokens == 60)
++        #expect(afterHour?.totalTokens == 100)
++        let hourlyCost = (beforeHour?.costUSD ?? 0) + (afterHour?.costUSD ?? 0)
++        #expect(abs((report.data.first?.costUSD ?? 0) - hourlyCost) < 1e-9)
++        #expect((beforeHour?.costUSD ?? 0) > 0)
++        #expect((afterHour?.costUSD ?? 0) > 0)
++
++        let snapshot = CostUsageFetcher.tokenSnapshot(
++            from: report,
++            now: after,
++            historyDays: 30,
++            calendar: calendar)
++        let weeks = snapshot.quotaWeekSummaries(
++            resetAt: after,
++            windowMinutes: CostUsageTokenSnapshot.quotaWeekMinutes,
++            calendar: calendar)
++        #expect(weeks.first { $0.isCurrent }?.totalCostUSD == afterHour?.costUSD)
++        #expect(weeks.first { $0.offset == 1 }?.totalCostUSD == beforeHour?.costUSD)
++    }
++
++    private static func utcDate(year: Int, month: Int, day: Int, hour: Int) -> Date {
++        var components = DateComponents()
++        components.calendar = self.utcCalendar
++        components.timeZone = TimeZone(secondsFromGMT: 0)
++        components.year = year
++        components.month = month
++        components.day = day
++        components.hour = hour
++        return components.date!
++    }
++
++    private static var utcCalendar: Calendar {
++        var calendar = Calendar(identifier: .gregorian)
++        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
++        return calendar
++    }
++}
+diff --git a/TestsLinux/CostUsageQuotaWeekLinuxTests.swift b/TestsLinux/CostUsageQuotaWeekLinuxTests.swift
+index 0af012c4d..08afb0890 100644
+--- a/TestsLinux/CostUsageQuotaWeekLinuxTests.swift
++++ b/TestsLinux/CostUsageQuotaWeekLinuxTests.swift
+@@ -85,6 +85,94 @@ struct CostUsageQuotaWeekLinuxTests {
+         #expect(weeks.first?.totalCostUSD == 5)
+     }
+ 
++    @Test
++    func `daily fallback assigns a reset day to exactly one week`() {
++        let now = Self.utcDate(year: 2026, month: 7, day: 12, hour: 12)
++        let resetAt = Self.utcDate(year: 2026, month: 7, day: 18, hour: 15)
++        let snapshot = Self.snapshot(
++            historyDays: 30,
++            daily: [
++                Self.entry(day: "2026-07-11", cost: 6, tokens: 600),
++                Self.entry(day: "2026-07-12", cost: 2, tokens: 200),
++            ],
++            updatedAt: now)
++
++        let weeks = snapshot.quotaWeekSummaries(
++            resetAt: resetAt,
++            windowMinutes: CostUsageTokenSnapshot.quotaWeekMinutes,
++            calendar: Self.utcCalendar)
++        let current = weeks.first { $0.isCurrent }
++        let previous = weeks.first { $0.offset == 1 }
++
++        #expect(current?.totalCostUSD == 2)
++        #expect(current?.totalTokens == 200)
++        #expect(previous?.totalCostUSD == 6)
++        #expect(previous?.totalTokens == 600)
++        #expect((current?.totalCostUSD ?? 0) + (previous?.totalCostUSD ?? 0) == 8)
++    }
++
++    @Test
++    func `hourly buckets split the reset day at the reset instant`() {
++        let now = Self.utcDate(year: 2026, month: 7, day: 12, hour: 12)
++        let resetAt = Self.utcDate(year: 2026, month: 7, day: 11, hour: 15)
++        let hourBefore = Self.utcDate(year: 2026, month: 7, day: 11, hour: 14)
++        let hourAtReset = Self.utcDate(year: 2026, month: 7, day: 11, hour: 15)
++        let snapshot = Self.snapshot(
++            historyDays: 30,
++            daily: [
++                Self.entry(day: "2026-07-11", cost: 6, tokens: 600),
++            ],
++            hourly: [
++                CostUsageHourlyEntry(hour: hourBefore, totalTokens: 200, costUSD: 2),
++                CostUsageHourlyEntry(hour: hourAtReset, totalTokens: 400, costUSD: 4),
++            ],
++            updatedAt: now)
++
++        let weeks = snapshot.quotaWeekSummaries(
++            resetAt: resetAt,
++            windowMinutes: CostUsageTokenSnapshot.quotaWeekMinutes,
++            calendar: Self.utcCalendar)
++        let current = weeks.first { $0.isCurrent }
++        let previous = weeks.first { $0.offset == 1 }
++
++        #expect(current?.totalCostUSD == 4)
++        #expect(current?.totalTokens == 400)
++        #expect(previous?.totalCostUSD == 2)
++        #expect(previous?.totalTokens == 200)
++        #expect((current?.totalCostUSD ?? 0) + (previous?.totalCostUSD ?? 0) == 6)
++        #expect(current?.entryCount == 1)
++        #expect(previous?.entryCount == 1)
++    }
++
++    @Test
++    func `hourly membership is exclusive across adjacent weeks`() {
++        let now = Self.utcDate(year: 2026, month: 7, day: 15, hour: 12)
++        let resetAt = Self.utcDate(year: 2026, month: 7, day: 18, hour: 15)
++        var hours: [CostUsageHourlyEntry] = []
++        for day in 8...15 {
++            for hour in [0, 14, 15, 23] {
++                hours.append(CostUsageHourlyEntry(
++                    hour: Self.utcDate(year: 2026, month: 7, day: day, hour: hour),
++                    totalTokens: 10,
++                    costUSD: 1))
++            }
++        }
++        let snapshot = Self.snapshot(
++            historyDays: 30,
++            daily: [Self.entry(day: "2026-07-15", cost: Double(hours.count), tokens: hours.count * 10)],
++            hourly: hours,
++            updatedAt: now)
++
++        let weeks = snapshot.quotaWeekSummaries(
++            resetAt: resetAt,
++            windowMinutes: CostUsageTokenSnapshot.quotaWeekMinutes,
++            calendar: Self.utcCalendar)
++        let counted = weeks.reduce(0) { $0 + $1.entryCount }
++        let cost = weeks.compactMap(\.totalCostUSD).reduce(0, +)
++        #expect(counted == hours.count)
++        #expect(cost == Double(hours.count))
++    }
++
+     @Test
+     func `session window minutes are ignored for weekly alignment`() {
+         let session = RateWindow(
+@@ -97,9 +185,49 @@ struct CostUsageQuotaWeekLinuxTests {
+             == CostUsageTokenSnapshot.quotaWeekMinutes)
+     }
+ 
++    @Test
++    func `merged report keeps hourly buckets and synthesizes daily-only sources`() {
++        let hour = Self.utcDate(year: 2026, month: 7, day: 11, hour: 15)
++        let native = CostUsageDailyReport(
++            data: [
++                CostUsageDailyReport.Entry(
++                    date: "2026-07-11",
++                    inputTokens: 100,
++                    outputTokens: 20,
++                    totalTokens: 120,
++                    costUSD: 1.2,
++                    modelsUsed: ["gpt-5.4"],
++                    modelBreakdowns: nil),
++            ],
++            summary: nil,
++            hourly: [CostUsageHourlyEntry(hour: hour, totalTokens: 120, costUSD: 1.2)])
++        let pi = CostUsageDailyReport(
++            data: [
++                CostUsageDailyReport.Entry(
++                    date: "2026-07-11",
++                    inputTokens: 10,
++                    outputTokens: 5,
++                    totalTokens: 15,
++                    costUSD: 0.3,
++                    modelsUsed: ["gpt-5.4"],
++                    modelBreakdowns: nil),
++            ],
++            summary: nil)
++
++        let merged = CostUsageDailyReport.merged([native, pi], calendar: Self.utcCalendar)
++        #expect(merged.hourly.count == 2)
++        let resetHour = merged.hourly.first { $0.hour == hour }
++        let midnight = merged.hourly.first { $0.hour == Self.utcDate(year: 2026, month: 7, day: 11, hour: 0) }
++        #expect(resetHour?.costUSD == 1.2)
++        #expect(resetHour?.totalTokens == 120)
++        #expect(midnight?.costUSD == 0.3)
++        #expect(midnight?.totalTokens == 15)
++    }
++
+     private static func snapshot(
+         historyDays: Int,
+         daily: [CostUsageDailyReport.Entry],
++        hourly: [CostUsageHourlyEntry] = [],
+         updatedAt: Date) -> CostUsageTokenSnapshot
+     {
+         CostUsageTokenSnapshot(
+@@ -109,6 +237,7 @@ struct CostUsageQuotaWeekLinuxTests {
+             last30DaysCostUSD: daily.compactMap(\.costUSD).reduce(0, +),
+             historyDays: historyDays,
+             daily: daily,
++            hourly: hourly,
+             updatedAt: updatedAt)
+     }
+ 
+-- 
+2.43.0
+
