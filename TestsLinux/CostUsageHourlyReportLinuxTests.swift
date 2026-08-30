@@ -133,7 +133,7 @@ struct CostUsageHourlyReportLinuxTests {
         #expect(beforeHour?.totalTokens == 60)
         #expect(afterHour?.totalTokens == 100)
         let hourlyCost = (beforeHour?.costUSD ?? 0) + (afterHour?.costUSD ?? 0)
-        #expect(abs((report.data.first?.costUSD ?? 0) - hourlyCost) \u003c 1e-9)
+        #expect(abs((report.data.first?.costUSD ?? 0) - hourlyCost) < 1e-9)
         #expect((beforeHour?.costUSD ?? 0) > 0)
         #expect((afterHour?.costUSD ?? 0) > 0)
 
