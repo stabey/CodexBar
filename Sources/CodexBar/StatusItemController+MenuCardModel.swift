@@ -92,7 +92,7 @@ extension StatusItemController {
 
         let sourceLabel = sourceLabelOverride ?? (surface == .liveCard ? self.store.sourceLabel(for: target) : nil)
         // Provider-specific by design: Kilo's automatic source mode is surfaced as card fallback context.
-        let kiloAutoMode = target == .kilo \u0026\u0026 self.settings.kiloUsageDataSource == .auto
+        let kiloAutoMode = target == .kilo && self.settings.kiloUsageDataSource == .auto
         let (weeklyPace, sessionEquivalentForecast) = self.resolvePaceAndForecast(
             target: target,
             snapshot: snapshot,
@@ -141,7 +141,7 @@ extension StatusItemController {
             // do with whether this row should show, silently disabling the Cost row for those
             // providers too (e.g. groq's addition to the inline-dashboard set previously did this).
             tokenCostMenuSectionEnabled: ProviderDescriptorRegistry.descriptor(for: target).tokenCost
-                .showsCostMenuSection \u0026\u0026
+                .showsCostMenuSection &&
                 self.settings.costSummaryShowsSubmenu(for: target),
             costComparisonPeriodsEnabled: self.settings.costComparisonPeriodsEnabled,
             showOptionalCreditsAndExtraUsage: self.settings.showOptionalCreditsAndExtraUsage,
