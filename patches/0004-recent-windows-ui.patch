@@ -1,0 +1,732 @@
+From c5d5923fa1c53e6f1ab63e0363f6814e3bf956a1 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sun, 30 Aug 2026 05:37:02 +0000
+Subject: [PATCH 4/4] Show recent quota windows on Codex and Claude cards
+
+Move weekly window history out of the gray caption and into a dedicated
+Recent windows list with range, cost, and tokens.
+
+Co-authored-by: stabeyzhou <stabeyzhou@gmail.com>
+---
+ CHANGELOG.md                                  |   2 +-
+ .../InlineUsageDashboardContent.swift         | 109 ++++++++++--
+ .../CodexBar/MenuCardHeightFingerprint.swift  |  11 ++
+ .../CodexBar/MenuCardView+ModelHelpers.swift  |   4 +
+ .../Resources/ar.lproj/Localizable.strings    |   1 +
+ .../Resources/ca.lproj/Localizable.strings    |   1 +
+ .../Resources/de.lproj/Localizable.strings    |   1 +
+ .../Resources/en.lproj/Localizable.strings    |   1 +
+ .../Resources/es.lproj/Localizable.strings    |   1 +
+ .../Resources/fa.lproj/Localizable.strings    |   1 +
+ .../Resources/fr.lproj/Localizable.strings    |   1 +
+ .../Resources/gl.lproj/Localizable.strings    |   1 +
+ .../Resources/id.lproj/Localizable.strings    |   1 +
+ .../Resources/it.lproj/Localizable.strings    |   1 +
+ .../Resources/ja.lproj/Localizable.strings    |   1 +
+ .../Resources/ko.lproj/Localizable.strings    |   1 +
+ .../Resources/nl.lproj/Localizable.strings    |   1 +
+ .../Resources/pl.lproj/Localizable.strings    |   1 +
+ .../Resources/pt-BR.lproj/Localizable.strings |   1 +
+ .../Resources/ru.lproj/Localizable.strings    |   1 +
+ .../Resources/sv.lproj/Localizable.strings    |   1 +
+ .../Resources/th.lproj/Localizable.strings    |   1 +
+ .../Resources/tr.lproj/Localizable.strings    |   1 +
+ .../Resources/uk.lproj/Localizable.strings    |   1 +
+ .../Resources/vi.lproj/Localizable.strings    |   1 +
+ .../zh-Hans.lproj/Localizable.strings         |   1 +
+ .../zh-Hant.lproj/Localizable.strings         |   1 +
+ ...InlineCostHistoryDashboardLabelTests.swift | 167 +++++++++++++++++-
+ docs/ui.md                                    |   2 +
+ 29 files changed, 302 insertions(+), 16 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 33f53cfa1..2b283fb58 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,7 +3,7 @@
+ ## 0.56.1 — Unreleased
+ 
+ ### Added
+-- Codex and Claude: show this week's local cost and tokens next to Today, split at the live Weekly reset instant rather than double-counting the reset calendar day, with compact Last week / previous-window totals under the daily chart. Official and banked resets observed on the same day become separate windows when a prior Weekly `resetsAt` or redeemed reset credit is still on file.
++- Codex and Claude: show this week's local cost and tokens next to Today, split at the live Weekly reset instant rather than double-counting the reset calendar day, with a Recent windows list (range, cost, tokens) under the daily chart. Official and banked resets observed on the same day become separate windows when a prior Weekly `resetsAt` or redeemed reset credit is still on file.
+ 
+ ### Fixed
+ - Antigravity: reuse a running `agy` by its verified executable path even when its command line uses a bare name, and preserve CLI sign-in guidance when an IDE fallback has no CSRF token (follow-up to #3146). Thanks @haixing23!
+diff --git a/Sources/CodexBar/InlineUsageDashboardContent.swift b/Sources/CodexBar/InlineUsageDashboardContent.swift
+index e5a1a49e1..1a54ac0df 100644
+--- a/Sources/CodexBar/InlineUsageDashboardContent.swift
++++ b/Sources/CodexBar/InlineUsageDashboardContent.swift
+@@ -22,11 +22,20 @@ struct InlineUsageDashboardModel: Equatable {
+         case points
+     }
+ 
++    struct QuotaWindow: Equatable, Identifiable {
++        let id: String
++        let title: String
++        let range: String
++        let value: String
++    }
++
+     let accessibilityLabel: String
+     let valueStyle: ValueStyle
+     let kpis: [KPI]
+     let points: [Point]
+     let detailLines: [String]
++    /// Codex/Claude weekly quota windows, newest first. Empty for other cost dashboards.
++    var quotaWindows: [QuotaWindow] = []
+     /// Provider branding color used to fill the mini usage bars. When nil the bars fall back to a
+     /// neutral palette derived from `valueStyle`.
+     var barColor: Color?
+@@ -237,13 +246,12 @@ extension UsageMenuCardView.Model {
+         let weekCostValue = currentWeek?.totalCostUSD.map(convertedString) ?? "—"
+         let weekTokenValue = currentWeek?.totalTokens.map(UsageFormatter.tokenCountString) ?? "—"
+ 
++        let quotaWindowRows: [InlineUsageDashboardModel.QuotaWindow] = quotaWeeks.compactMap { week in
++            guard week.isCurrent || week.entryCount > 0 else { return nil }
++            let cost = week.totalCostUSD.map(convertedString) ?? "—"
++            return Self.quotaWindowRow(week: week, cost: cost, calendar: calendar)
++        }
+         var details: [String] = []
+-        details.append(contentsOf: quotaWeeks.compactMap { week in
+-            guard week.offset > 0, week.entryCount > 0 else { return nil }
+-            return Self.quotaWeekDetailLine(
+-                week: week,
+-                cost: week.totalCostUSD.map(convertedString) ?? "—")
+-        })
+         if comparisonPeriodsEnabled {
+             details.append(contentsOf: snapshot.comparisonSummaries().map {
+                 let label = Self.costHistoryWindowLabel(days: $0.days)
+@@ -332,6 +340,7 @@ extension UsageMenuCardView.Model {
+             kpis: kpis,
+             points: points,
+             detailLines: details)
++        model.quotaWindows = quotaWindowRows
+         model.currencyCode = displayCurrencyCode
+         return model
+     }
+@@ -343,14 +352,51 @@ extension UsageMenuCardView.Model {
+         } ?? []
+     }
+ 
+-    private static func quotaWeekDetailLine(week: CostUsageQuotaWeek, cost: String) -> String {
+-        let label = Self.quotaWeekHistoryLabel(week: week)
+-        guard let totalTokens = week.totalTokens else { return "\(label): \(cost)" }
+-        return String(
+-            format: L("%@: %@ · %@ tokens"),
+-            label,
+-            cost,
+-            UsageFormatter.tokenCountString(totalTokens))
++    private static func quotaWindowRow(
++        week: CostUsageQuotaWeek,
++        cost: String,
++        calendar: Calendar) -> InlineUsageDashboardModel.QuotaWindow
++    {
++        let value: String = if let totalTokens = week.totalTokens {
++            "\(cost) · \(UsageFormatter.tokenCountString(totalTokens))"
++        } else {
++            cost
++        }
++        return InlineUsageDashboardModel.QuotaWindow(
++            id: "\(week.offset)-\(Int(week.start.timeIntervalSince1970))",
++            title: Self.quotaWeekHistoryLabel(week: week),
++            range: Self.quotaWindowRangeLabel(start: week.start, end: week.end, calendar: calendar),
++            value: value)
++    }
++
++    static func quotaWindowRangeLabel(
++        start: Date,
++        end: Date,
++        calendar: Calendar,
++        locale: Locale = codexBarLocalizedResourceLocale()) -> String
++    {
++        let startDay = calendar.dateComponents([.year, .month, .day], from: start)
++        let endDay = calendar.dateComponents([.year, .month, .day], from: end)
++        let sameDay = startDay.year == endDay.year
++            && startDay.month == endDay.month
++            && startDay.day == endDay.day
++        let sameYear = startDay.year == endDay.year
++        func formatter(template: String) -> DateFormatter {
++            let formatter = DateFormatter()
++            formatter.locale = locale
++            formatter.calendar = calendar
++            formatter.timeZone = calendar.timeZone
++            formatter.setLocalizedDateFormatFromTemplate(template)
++            return formatter
++        }
++        if sameDay {
++            let startText = formatter(template: "MMMdjmm").string(from: start)
++            let endText = formatter(template: "jmm").string(from: end)
++            return "\(startText) – \(endText)"
++        }
++        let template = sameYear ? "MMMdjmm" : "yMMMdjmm"
++        let rangeFormatter = formatter(template: template)
++        return "\(rangeFormatter.string(from: start)) – \(rangeFormatter.string(from: end))"
+     }
+ 
+     private static func quotaWeekHistoryLabel(week: CostUsageQuotaWeek) -> String {
+@@ -507,6 +553,9 @@ struct InlineUsageDashboardContent: View {
+                     .accessibilityElement(children: .contain)
+                     .accessibilityLabel(self.model.accessibilityLabel)
+             }
++            if !self.model.quotaWindows.isEmpty {
++                self.quotaWindows
++            }
+             self.detailLines
+         }
+         .frame(maxWidth: .infinity, alignment: .leading)
+@@ -527,6 +576,38 @@ struct InlineUsageDashboardContent: View {
+         }
+     }
+ 
++    private var quotaWindows: some View {
++        VStack(alignment: .leading, spacing: 6) {
++            Text(L("Recent windows"))
++                .font(.caption2)
++                .foregroundStyle(MenuHighlightStyle.secondary(self.isHighlighted))
++            ForEach(self.model.quotaWindows) { window in
++                VStack(alignment: .leading, spacing: 1) {
++                    HStack(alignment: .firstTextBaseline, spacing: 8) {
++                        Text(window.title)
++                            .font(.caption)
++                            .foregroundStyle(MenuHighlightStyle.primary(self.isHighlighted))
++                            .lineLimit(1)
++                        Spacer(minLength: 8)
++                        Text(window.value)
++                            .font(.caption)
++                            .fontWeight(.semibold)
++                            .foregroundStyle(MenuHighlightStyle.primary(self.isHighlighted))
++                            .lineLimit(1)
++                            .minimumScaleFactor(0.8)
++                            .monospacedDigit()
++                    }
++                    Text(window.range)
++                        .font(.caption2)
++                        .foregroundStyle(MenuHighlightStyle.secondary(self.isHighlighted))
++                        .lineLimit(1)
++                        .minimumScaleFactor(0.8)
++                }
++                .accessibilityElement(children: .combine)
++            }
++        }
++    }
++
+     private var detailLines: some View {
+         VStack(alignment: .leading, spacing: 3) {
+             ForEach(Array(self.model.detailLines.enumerated()), id: \.offset) { _, line in
+diff --git a/Sources/CodexBar/MenuCardHeightFingerprint.swift b/Sources/CodexBar/MenuCardHeightFingerprint.swift
+index 6906a242d..e0dde6535 100644
+--- a/Sources/CodexBar/MenuCardHeightFingerprint.swift
++++ b/Sources/CodexBar/MenuCardHeightFingerprint.swift
+@@ -168,11 +168,22 @@ extension InlineUsageDashboardModel {
+             self.valueStyle.heightFingerprint,
+             MenuCardHeightFingerprint.join(self.kpis.map(\.heightFingerprint)),
+             MenuCardHeightFingerprint.join(self.points.map(\.heightFingerprint)),
++            MenuCardHeightFingerprint.join(self.quotaWindows.map(\.heightFingerprint)),
+             MenuCardHeightFingerprint.join(self.detailLines.map { MenuCardHeightFingerprint.field("detail", $0) }),
+         ])
+     }
+ }
+ 
++extension InlineUsageDashboardModel.QuotaWindow {
++    fileprivate var heightFingerprint: String {
++        MenuCardHeightFingerprint.join([
++            MenuCardHeightFingerprint.field("qwTitle", self.title),
++            MenuCardHeightFingerprint.field("qwRange", self.range),
++            MenuCardHeightFingerprint.field("qwValue", self.value),
++        ])
++    }
++}
++
+ extension InlineUsageDashboardModel.KPI {
+     fileprivate var heightFingerprint: String {
+         MenuCardHeightFingerprint.join([
+diff --git a/Sources/CodexBar/MenuCardView+ModelHelpers.swift b/Sources/CodexBar/MenuCardView+ModelHelpers.swift
+index 5eed19f13..629f29f21 100644
+--- a/Sources/CodexBar/MenuCardView+ModelHelpers.swift
++++ b/Sources/CodexBar/MenuCardView+ModelHelpers.swift
+@@ -479,12 +479,16 @@ extension UsageMenuCardView.Model {
+             current.valueStyle == candidate.valueStyle &&
+                 current.kpis.count == candidate.kpis.count &&
+                 current.points.count == candidate.points.count &&
++                current.quotaWindows.count == candidate.quotaWindows.count &&
+                 current.detailLines.count == candidate.detailLines.count &&
+                 zip(current.kpis, candidate.kpis).allSatisfy {
+                     $0.title == $1.title && $0.emphasis == $1.emphasis
+                 } &&
+                 zip(current.points, candidate.points).allSatisfy {
+                     $0.id == $1.id && $0.label == $1.label
++                } &&
++                zip(current.quotaWindows, candidate.quotaWindows).allSatisfy {
++                    $0.title == $1.title && $0.range == $1.range
+                 }
+         default:
+             false
+diff --git a/Sources/CodexBar/Resources/ar.lproj/Localizable.strings b/Sources/CodexBar/Resources/ar.lproj/Localizable.strings
+index d731bb866..9e38d4236 100644
+--- a/Sources/CodexBar/Resources/ar.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/ar.lproj/Localizable.strings
+@@ -892,6 +892,7 @@
+ "%d weeks ago" = "قبل %d أسابيع";
+ "Previous window" = "النافذة السابقة";
+ "%d windows ago" = "قبل %d نوافذ";
++"Recent windows" = "النوافذ الأخيرة";
+ "Week" = "الأسبوع";
+ "Month" = "الشهر";
+ "Models" = "النماذج";
+diff --git a/Sources/CodexBar/Resources/ca.lproj/Localizable.strings b/Sources/CodexBar/Resources/ca.lproj/Localizable.strings
+index 9abefaa98..0e9a6981e 100644
+--- a/Sources/CodexBar/Resources/ca.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/ca.lproj/Localizable.strings
+@@ -899,6 +899,7 @@
+ "%d weeks ago" = "fa %d setmanes";
+ "Previous window" = "Finestra anterior";
+ "%d windows ago" = "fa %d finestres";
++"Recent windows" = "Finestres recents";
+ "This month" = "Aquest mes";
+ "Week" = "Setmana";
+ "Month" = "Mes";
+diff --git a/Sources/CodexBar/Resources/de.lproj/Localizable.strings b/Sources/CodexBar/Resources/de.lproj/Localizable.strings
+index 88930e902..a4c125c55 100644
+--- a/Sources/CodexBar/Resources/de.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/de.lproj/Localizable.strings
+@@ -884,6 +884,7 @@
+ "%d weeks ago" = "vor %d Wochen";
+ "Previous window" = "Vorheriges Fenster";
+ "%d windows ago" = "vor %d Fenstern";
++"Recent windows" = "Letzte Fenster";
+ "Week" = "Woche";
+ "Month" = "Monat";
+ "Models" = "Modelle";
+diff --git a/Sources/CodexBar/Resources/en.lproj/Localizable.strings b/Sources/CodexBar/Resources/en.lproj/Localizable.strings
+index ba0087daa..6ac3a4b7a 100644
+--- a/Sources/CodexBar/Resources/en.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/en.lproj/Localizable.strings
+@@ -872,6 +872,7 @@
+ "%d weeks ago" = "%d weeks ago";
+ "Previous window" = "Previous window";
+ "%d windows ago" = "%d windows ago";
++"Recent windows" = "Recent windows";
+ "Week" = "Week";
+ "Month" = "Month";
+ "Models" = "Models";
+diff --git a/Sources/CodexBar/Resources/es.lproj/Localizable.strings b/Sources/CodexBar/Resources/es.lproj/Localizable.strings
+index 787612f06..c30acb823 100644
+--- a/Sources/CodexBar/Resources/es.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/es.lproj/Localizable.strings
+@@ -901,6 +901,7 @@
+ "%d weeks ago" = "hace %d semanas";
+ "Previous window" = "Ventana anterior";
+ "%d windows ago" = "hace %d ventanas";
++"Recent windows" = "Ventanas recientes";
+ "This month" = "Este mes";
+ "Week" = "Semana";
+ "Month" = "Mes";
+diff --git a/Sources/CodexBar/Resources/fa.lproj/Localizable.strings b/Sources/CodexBar/Resources/fa.lproj/Localizable.strings
+index f35b9d474..cb482167f 100644
+--- a/Sources/CodexBar/Resources/fa.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/fa.lproj/Localizable.strings
+@@ -892,6 +892,7 @@
+ "%d weeks ago" = "%d هفته پیش";
+ "Previous window" = "پنجره قبلی";
+ "%d windows ago" = "%d پنجره پیش";
++"Recent windows" = "پنجره‌های اخیر";
+ "Week" = "هفته";
+ "Month" = "ماه";
+ "Models" = "مدل ها";
+diff --git a/Sources/CodexBar/Resources/fr.lproj/Localizable.strings b/Sources/CodexBar/Resources/fr.lproj/Localizable.strings
+index 73ac54b08..b7aeb28e7 100644
+--- a/Sources/CodexBar/Resources/fr.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/fr.lproj/Localizable.strings
+@@ -886,6 +886,7 @@
+ "%d weeks ago" = "il y a %d semaines";
+ "Previous window" = "Fenêtre précédente";
+ "%d windows ago" = "il y a %d fenêtres";
++"Recent windows" = "Fenêtres récentes";
+ "Week" = "Semaine";
+ "Month" = "Mois";
+ "Models" = "Modèles";
+diff --git a/Sources/CodexBar/Resources/gl.lproj/Localizable.strings b/Sources/CodexBar/Resources/gl.lproj/Localizable.strings
+index e798664cd..63ea051ce 100644
+--- a/Sources/CodexBar/Resources/gl.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/gl.lproj/Localizable.strings
+@@ -888,6 +888,7 @@
+ "%d weeks ago" = "hai %d semanas";
+ "Previous window" = "Xanela anterior";
+ "%d windows ago" = "hai %d xanelas";
++"Recent windows" = "Xanelas recentes";
+ "This month" = "Este mes";
+ "Week" = "Semana";
+ "Month" = "Mes";
+diff --git a/Sources/CodexBar/Resources/id.lproj/Localizable.strings b/Sources/CodexBar/Resources/id.lproj/Localizable.strings
+index eb8a865ca..5bd777af7 100644
+--- a/Sources/CodexBar/Resources/id.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/id.lproj/Localizable.strings
+@@ -894,6 +894,7 @@
+ "%d weeks ago" = "%d minggu lalu";
+ "Previous window" = "Jendela sebelumnya";
+ "%d windows ago" = "%d jendela lalu";
++"Recent windows" = "Jendela terbaru";
+ "Week" = "Minggu";
+ "Month" = "Bulan";
+ "Models" = "Model";
+diff --git a/Sources/CodexBar/Resources/it.lproj/Localizable.strings b/Sources/CodexBar/Resources/it.lproj/Localizable.strings
+index 0a6b78a94..b2abffe45 100644
+--- a/Sources/CodexBar/Resources/it.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/it.lproj/Localizable.strings
+@@ -894,6 +894,7 @@
+ "%d weeks ago" = "%d settimane fa";
+ "Previous window" = "Finestra precedente";
+ "%d windows ago" = "%d finestre fa";
++"Recent windows" = "Finestre recenti";
+ "Week" = "Settimana";
+ "Month" = "Mese";
+ "Models" = "Modelli";
+diff --git a/Sources/CodexBar/Resources/ja.lproj/Localizable.strings b/Sources/CodexBar/Resources/ja.lproj/Localizable.strings
+index 313ca439b..4c2710548 100644
+--- a/Sources/CodexBar/Resources/ja.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/ja.lproj/Localizable.strings
+@@ -883,6 +883,7 @@
+ "%d weeks ago" = "%d週間前";
+ "Previous window" = "前のウィンドウ";
+ "%d windows ago" = "%dウィンドウ前";
++"Recent windows" = "最近のウィンドウ";
+ "Week" = "週";
+ "Month" = "月";
+ "Models" = "モデル";
+diff --git a/Sources/CodexBar/Resources/ko.lproj/Localizable.strings b/Sources/CodexBar/Resources/ko.lproj/Localizable.strings
+index f36dc7b4f..5e61e99cc 100644
+--- a/Sources/CodexBar/Resources/ko.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/ko.lproj/Localizable.strings
+@@ -858,6 +858,7 @@
+ "%d weeks ago" = "%d주 전";
+ "Previous window" = "이전 구간";
+ "%d windows ago" = "%d개 구간 전";
++"Recent windows" = "최근 구간";
+ "Week" = "주";
+ "Month" = "월";
+ "Models" = "모델";
+diff --git a/Sources/CodexBar/Resources/nl.lproj/Localizable.strings b/Sources/CodexBar/Resources/nl.lproj/Localizable.strings
+index 93dc8fce1..5c936707c 100644
+--- a/Sources/CodexBar/Resources/nl.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/nl.lproj/Localizable.strings
+@@ -886,6 +886,7 @@
+ "%d weeks ago" = "%d weken geleden";
+ "Previous window" = "Vorig venster";
+ "%d windows ago" = "%d vensters geleden";
++"Recent windows" = "Recente vensters";
+ "Week" = "Week";
+ "Month" = "Maand";
+ "Models" = "Modellen";
+diff --git a/Sources/CodexBar/Resources/pl.lproj/Localizable.strings b/Sources/CodexBar/Resources/pl.lproj/Localizable.strings
+index 6bc111dca..36c2e7ca3 100644
+--- a/Sources/CodexBar/Resources/pl.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/pl.lproj/Localizable.strings
+@@ -894,6 +894,7 @@
+ "%d weeks ago" = "%d tyg. temu";
+ "Previous window" = "Poprzednie okno";
+ "%d windows ago" = "%d okna temu";
++"Recent windows" = "Ostatnie okna";
+ "Week" = "Tydzień";
+ "Month" = "Miesiąc";
+ "Models" = "Modele";
+diff --git a/Sources/CodexBar/Resources/pt-BR.lproj/Localizable.strings b/Sources/CodexBar/Resources/pt-BR.lproj/Localizable.strings
+index 4c3ac6116..5d5514fef 100644
+--- a/Sources/CodexBar/Resources/pt-BR.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/pt-BR.lproj/Localizable.strings
+@@ -883,6 +883,7 @@
+ "%d weeks ago" = "%d semanas atrás";
+ "Previous window" = "Janela anterior";
+ "%d windows ago" = "%d janelas atrás";
++"Recent windows" = "Janelas recentes";
+ "Week" = "Semana";
+ "Month" = "Mês";
+ "Models" = "Modelos";
+diff --git a/Sources/CodexBar/Resources/ru.lproj/Localizable.strings b/Sources/CodexBar/Resources/ru.lproj/Localizable.strings
+index 85619aa6c..96db6108c 100644
+--- a/Sources/CodexBar/Resources/ru.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/ru.lproj/Localizable.strings
+@@ -887,6 +887,7 @@
+ "%d weeks ago" = "%d нед. назад";
+ "Previous window" = "Предыдущее окно";
+ "%d windows ago" = "%d окн. назад";
++"Recent windows" = "Недавние окна";
+ "Week" = "неделя";
+ "Month" = "Месяц";
+ "Models" = "Модели";
+diff --git a/Sources/CodexBar/Resources/sv.lproj/Localizable.strings b/Sources/CodexBar/Resources/sv.lproj/Localizable.strings
+index 817d2ecc8..e5df4e914 100644
+--- a/Sources/CodexBar/Resources/sv.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/sv.lproj/Localizable.strings
+@@ -885,6 +885,7 @@
+ "%d weeks ago" = "för %d veckor sedan";
+ "Previous window" = "Föregående fönster";
+ "%d windows ago" = "för %d fönster sedan";
++"Recent windows" = "Senaste fönster";
+ "Week" = "Vecka";
+ "Month" = "Månad";
+ "Models" = "Modeller";
+diff --git a/Sources/CodexBar/Resources/th.lproj/Localizable.strings b/Sources/CodexBar/Resources/th.lproj/Localizable.strings
+index 905c14110..b53dd9f9d 100644
+--- a/Sources/CodexBar/Resources/th.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/th.lproj/Localizable.strings
+@@ -892,6 +892,7 @@
+ "%d weeks ago" = "%d สัปดาห์ที่แล้ว";
+ "Previous window" = "หน้าต่างก่อน";
+ "%d windows ago" = "%d หน้าต่างที่แล้ว";
++"Recent windows" = "หน้าต่างล่าสุด";
+ "Week" = "สัปดาห์";
+ "Month" = "เดือน";
+ "Models" = "โมเดล";
+diff --git a/Sources/CodexBar/Resources/tr.lproj/Localizable.strings b/Sources/CodexBar/Resources/tr.lproj/Localizable.strings
+index afe0d80bb..896dc2d0e 100644
+--- a/Sources/CodexBar/Resources/tr.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/tr.lproj/Localizable.strings
+@@ -888,6 +888,7 @@
+ "%d weeks ago" = "%d hafta önce";
+ "Previous window" = "Önceki pencere";
+ "%d windows ago" = "%d pencere önce";
++"Recent windows" = "Son pencereler";
+ "Week" = "Hafta";
+ "Month" = "Ay";
+ "Models" = "Modeller";
+diff --git a/Sources/CodexBar/Resources/uk.lproj/Localizable.strings b/Sources/CodexBar/Resources/uk.lproj/Localizable.strings
+index 2f03344be..be65cfcbf 100644
+--- a/Sources/CodexBar/Resources/uk.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/uk.lproj/Localizable.strings
+@@ -886,6 +886,7 @@
+ "%d weeks ago" = "%d тиж. тому";
+ "Previous window" = "Попереднє вікно";
+ "%d windows ago" = "%d вікн. тому";
++"Recent windows" = "Недавні вікна";
+ "Week" = "тиждень";
+ "Month" = "місяць";
+ "Models" = "Моделі";
+diff --git a/Sources/CodexBar/Resources/vi.lproj/Localizable.strings b/Sources/CodexBar/Resources/vi.lproj/Localizable.strings
+index 7e8fba6f0..5e06f6e15 100644
+--- a/Sources/CodexBar/Resources/vi.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/vi.lproj/Localizable.strings
+@@ -882,6 +882,7 @@
+ "%d weeks ago" = "%d tuần trước";
+ "Previous window" = "Cửa sổ trước";
+ "%d windows ago" = "%d cửa sổ trước";
++"Recent windows" = "Cửa sổ gần đây";
+ "Week" = "Tuần";
+ "Month" = "Tháng";
+ "Models" = "Mô hình";
+diff --git a/Sources/CodexBar/Resources/zh-Hans.lproj/Localizable.strings b/Sources/CodexBar/Resources/zh-Hans.lproj/Localizable.strings
+index d9b40e27a..18b47fbc4 100644
+--- a/Sources/CodexBar/Resources/zh-Hans.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/zh-Hans.lproj/Localizable.strings
+@@ -848,6 +848,7 @@
+ "%d weeks ago" = "%d 周前";
+ "Previous window" = "上一窗口";
+ "%d windows ago" = "%d 个窗口前";
++"Recent windows" = "最近窗口";
+ "Week" = "本周";
+ "Month" = "本月";
+ "Models" = "模型";
+diff --git a/Sources/CodexBar/Resources/zh-Hant.lproj/Localizable.strings b/Sources/CodexBar/Resources/zh-Hant.lproj/Localizable.strings
+index 5ffefd7c9..b5a91f679 100644
+--- a/Sources/CodexBar/Resources/zh-Hant.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/zh-Hant.lproj/Localizable.strings
+@@ -902,6 +902,7 @@
+ "%d weeks ago" = "%d 週前";
+ "Previous window" = "上一視窗";
+ "%d windows ago" = "%d 個視窗前";
++"Recent windows" = "最近視窗";
+ "Week" = "週";
+ "Month" = "月";
+ "Models" = "模型";
+diff --git a/Tests/CodexBarTests/InlineCostHistoryDashboardLabelTests.swift b/Tests/CodexBarTests/InlineCostHistoryDashboardLabelTests.swift
+index 7ad6e392e..31646a518 100644
+--- a/Tests/CodexBarTests/InlineCostHistoryDashboardLabelTests.swift
++++ b/Tests/CodexBarTests/InlineCostHistoryDashboardLabelTests.swift
+@@ -576,6 +576,171 @@ struct InlineCostHistoryDashboardLabelTests {
+             "$14.00",
+             "1.4K",
+         ])
+-        #expect(dashboard.detailLines.contains("Last week: $4.00 · 400 tokens"))
++        #expect(dashboard.detailLines.contains { $0.contains("Last week") } == false)
++        #expect(dashboard.quotaWindows.map(\.title) == ["This week", "Last week"])
++        #expect(dashboard.quotaWindows.map(\.value) == ["$10.00 · 1K", "$4.00 · 400"])
++        let currentRange = try #require(dashboard.quotaWindows.first?.range)
++        #expect(currentRange.contains("11"))
++        #expect(currentRange.contains("18"))
++    }
++
++    @Test
++    func `quota window range labels use the reset instant and collapse same-day windows`() throws {
++        var calendar = Calendar(identifier: .gregorian)
++        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
++        let locale = Locale(identifier: "en_US")
++        let start = try #require(calendar.date(from: DateComponents(
++            timeZone: calendar.timeZone,
++            year: 2026,
++            month: 7,
++            day: 11,
++            hour: 15)))
++        let end = try #require(calendar.date(from: DateComponents(
++            timeZone: calendar.timeZone,
++            year: 2026,
++            month: 7,
++            day: 18,
++            hour: 15)))
++        let sameDayEnd = try #require(calendar.date(from: DateComponents(
++            timeZone: calendar.timeZone,
++            year: 2026,
++            month: 7,
++            day: 11,
++            hour: 18)))
++
++        let weekRange = Self.normalizedDateText(UsageMenuCardView.Model.quotaWindowRangeLabel(
++            start: start,
++            end: end,
++            calendar: calendar,
++            locale: locale))
++        let sameDayRange = Self.normalizedDateText(UsageMenuCardView.Model.quotaWindowRangeLabel(
++            start: start,
++            end: sameDayEnd,
++            calendar: calendar,
++            locale: locale))
++        #expect(weekRange.contains("Jul 11"))
++        #expect(weekRange.contains("Jul 18"))
++        #expect(weekRange.contains("3:00") || weekRange.contains("15:00"))
++        #expect(sameDayRange.contains("Jul 11"))
++        #expect(sameDayRange.contains("6:00") || sameDayRange.contains("18:00"))
++        #expect(sameDayRange.contains("Jul 18") == false)
++    }
++
++    @Test
++    func `codex recent windows lists a short previous window after a banked reset`() throws {
++        var calendar = Calendar(identifier: .gregorian)
++        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
++        let now = try #require(calendar.date(from: DateComponents(
++            timeZone: calendar.timeZone,
++            year: 2026,
++            month: 7,
++            day: 17,
++            hour: 12)))
++        let official = try #require(calendar.date(from: DateComponents(
++            timeZone: calendar.timeZone,
++            year: 2026,
++            month: 7,
++            day: 16,
++            hour: 15)))
++        let liveNext = try #require(calendar.date(from: DateComponents(
++            timeZone: calendar.timeZone,
++            year: 2026,
++            month: 7,
++            day: 23,
++            hour: 18)))
++        let metadata = try #require(ProviderDefaults.metadata[.codex])
++        let hour14 = try #require(calendar.date(from: DateComponents(
++            timeZone: calendar.timeZone,
++            year: 2026,
++            month: 7,
++            day: 16,
++            hour: 14)))
++        let hour16 = try #require(calendar.date(from: DateComponents(
++            timeZone: calendar.timeZone,
++            year: 2026,
++            month: 7,
++            day: 16,
++            hour: 16)))
++        let hour19 = try #require(calendar.date(from: DateComponents(
++            timeZone: calendar.timeZone,
++            year: 2026,
++            month: 7,
++            day: 16,
++            hour: 19)))
++        let tokenSnapshot = CostUsageTokenSnapshot(
++            sessionTokens: 300,
++            sessionCostUSD: 3,
++            last30DaysTokens: 600,
++            last30DaysCostUSD: 6,
++            historyDays: 30,
++            daily: [
++                CostUsageDailyReport.Entry(
++                    date: "2026-07-16",
++                    inputTokens: 500,
++                    outputTokens: 100,
++                    totalTokens: 600,
++                    costUSD: 6,
++                    modelsUsed: ["gpt-5.4"],
++                    modelBreakdowns: [
++                        CostUsageDailyReport.ModelBreakdown(
++                            modelName: "gpt-5.4",
++                            costUSD: 6,
++                            totalTokens: 600),
++                    ]),
++            ],
++            hourly: [
++                CostUsageHourlyEntry(hour: hour14, totalTokens: 100, costUSD: 1),
++                CostUsageHourlyEntry(hour: hour16, totalTokens: 200, costUSD: 2),
++                CostUsageHourlyEntry(hour: hour19, totalTokens: 300, costUSD: 3),
++            ],
++            updatedAt: now)
++
++        let model = UsageMenuCardView.Model.make(.init(
++            provider: .codex,
++            metadata: metadata,
++            snapshot: UsageSnapshot(
++                primary: nil,
++                secondary: RateWindow(
++                    usedPercent: 40,
++                    windowMinutes: CostUsageTokenSnapshot.quotaWeekMinutes,
++                    resetsAt: liveNext,
++                    resetDescription: nil),
++                updatedAt: now),
++            credits: nil,
++            creditsError: nil,
++            dashboard: nil,
++            dashboardError: nil,
++            tokenSnapshot: tokenSnapshot,
++            tokenError: nil,
++            account: AccountInfo(email: nil, plan: nil),
++            isRefreshing: false,
++            lastError: nil,
++            usageBarsShowUsed: false,
++            resetTimeDisplayStyle: .countdown,
++            tokenCostUsageEnabled: true,
++            showOptionalCreditsAndExtraUsage: true,
++            hidePersonalInfo: false,
++            costUsageBucketCalendar: calendar,
++            now: now,
++            observedWeeklyNextResets: [official]))
++
++        let dashboard = try #require(model.inlineUsageDashboard)
++        #expect(dashboard.quotaWindows.map(\.title) == [
++            "This week",
++            "Previous window",
++            "2 weeks ago",
++        ])
++        #expect(dashboard.quotaWindows.map(\.value) == [
++            "$3.00 · 300",
++            "$2.00 · 200",
++            "$1.00 · 100",
++        ])
++        #expect(dashboard.detailLines.contains { $0.contains("Previous window") } == false)
++    }
++
++    private static func normalizedDateText(_ value: String) -> String {
++        value
++            .replacingOccurrences(of: "\u{202F}", with: " ")
++            .replacingOccurrences(of: "\u{00A0}", with: " ")
+     }
+ }
+diff --git a/docs/ui.md b/docs/ui.md
+index 287a66c2e..75d1fc9b2 100644
+--- a/docs/ui.md
++++ b/docs/ui.md
+@@ -70,6 +70,8 @@ model-generic token label while the rendered menu-bar prefix and accessibility l
+ - Codex credits can add a separate “Buy Credits…” menu action.
+ - Claude capped Extra Usage follows the used/remaining fill preference; spending amounts and “% used” copy stay unchanged.
+ - Codex OpenAI web extras: code review remaining and usage breakdown render when dashboard data is attached.
++- Codex and Claude cost cards: a Recent windows list under the daily bars shows each quota window's
++  range, cost, and tokens (This week, Last week / Previous window), split at official and banked resets.
+ - Token accounts: optional account switcher bar or stacked account cards (up to 6) when multiple manual tokens exist.
+ - Provider storage usage is opt-in from Advanced settings. When enabled, overview rows and provider detail cards can show
+   local provider-owned storage totals, with a submenu for path breakdowns and copyable paths.
+-- 
+2.43.0
+
