@@ -1,0 +1,994 @@
+From 2d51c6a251e5ebbcb4954007ee8deb9e531d80e4 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sun, 30 Aug 2026 03:48:17 +0000
+Subject: [PATCH 1/4] Show Codex and Claude weekly window cost next to Today
+
+Pair the live Weekly quota bar with local cost and token totals for the
+current reset window, and list the previous few weeks under the daily
+chart so spend can be compared without switching the 30-day history.
+
+Co-authored-by: stabeyzhou <stabeyzhou@gmail.com>
+---
+ CHANGELOG.md                                  |   3 +
+ .../InlineUsageDashboardContent.swift         | 104 +++++++++---
+ .../Resources/ar.lproj/Localizable.strings    |   2 +
+ .../Resources/ca.lproj/Localizable.strings    |   2 +
+ .../Resources/de.lproj/Localizable.strings    |   2 +
+ .../Resources/en.lproj/Localizable.strings    |   2 +
+ .../Resources/es.lproj/Localizable.strings    |   2 +
+ .../Resources/fa.lproj/Localizable.strings    |   2 +
+ .../Resources/fr.lproj/Localizable.strings    |   2 +
+ .../Resources/gl.lproj/Localizable.strings    |   2 +
+ .../Resources/id.lproj/Localizable.strings    |   2 +
+ .../Resources/it.lproj/Localizable.strings    |   2 +
+ .../Resources/ja.lproj/Localizable.strings    |   2 +
+ .../Resources/ko.lproj/Localizable.strings    |   2 +
+ .../Resources/nl.lproj/Localizable.strings    |   2 +
+ .../Resources/pl.lproj/Localizable.strings    |   2 +
+ .../Resources/pt-BR.lproj/Localizable.strings |   2 +
+ .../Resources/ru.lproj/Localizable.strings    |   2 +
+ .../Resources/sv.lproj/Localizable.strings    |   2 +
+ .../Resources/th.lproj/Localizable.strings    |   2 +
+ .../Resources/tr.lproj/Localizable.strings    |   2 +
+ .../Resources/uk.lproj/Localizable.strings    |   2 +
+ .../Resources/vi.lproj/Localizable.strings    |   2 +
+ .../zh-Hans.lproj/Localizable.strings         |   2 +
+ .../zh-Hant.lproj/Localizable.strings         |   2 +
+ Sources/CodexBarCore/CostUsageModels.swift    | 155 ++++++++++++++++++
+ ...InlineCostHistoryDashboardLabelTests.swift | 115 ++++++++++++-
+ TestsLinux/CostUsageQuotaWeekLinuxTests.swift | 142 ++++++++++++++++
+ 28 files changed, 540 insertions(+), 25 deletions(-)
+ create mode 100644 TestsLinux/CostUsageQuotaWeekLinuxTests.swift
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1fd0d557a..11d715cd7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,9 @@
+ 
+ ## 0.56.1 — Unreleased
+ 
++### Added
++- Codex and Claude: show this week's local cost and tokens next to Today, aligned to the live Weekly reset when known, with compact Last week / 2–3 weeks ago totals under the daily chart.
++
+ ### Fixed
+ - Antigravity: reuse a running `agy` by its verified executable path even when its command line uses a bare name, and preserve CLI sign-in guidance when an IDE fallback has no CSRF token (follow-up to #3146). Thanks @haixing23!
+ - Codex: add redacted weekly-reset diagnostic reasons for candidate admission, expiry, and account-scoped storage requests without changing reset publication rules (investigated alongside #3248). Thanks @kcharlan!
+diff --git a/Sources/CodexBar/InlineUsageDashboardContent.swift b/Sources/CodexBar/InlineUsageDashboardContent.swift
+index 6e6f97efb..71c4f9cb4 100644
+--- a/Sources/CodexBar/InlineUsageDashboardContent.swift
++++ b/Sources/CodexBar/InlineUsageDashboardContent.swift
+@@ -103,7 +103,8 @@ extension UsageMenuCardView.Model {
+                 snapshot: tokenSnapshot,
+                 comparisonPeriodsEnabled: input.costComparisonPeriodsEnabled,
+                 preferredCurrencyCode: input.preferredCurrencyCode,
+-                calendar: input.costUsageBucketCalendar)
++                calendar: input.costUsageBucketCalendar,
++                weeklyWindow: input.snapshot?.secondary)
+         }
+         if menuCard.supportsInlineTokenCostDashboard,
+            input.costSummaryInlineEnabled,
+@@ -115,7 +116,8 @@ extension UsageMenuCardView.Model {
+                 snapshot: tokenSnapshot,
+                 comparisonPeriodsEnabled: input.costComparisonPeriodsEnabled,
+                 preferredCurrencyCode: input.preferredCurrencyCode,
+-                calendar: input.costUsageBucketCalendar)
++                calendar: input.costUsageBucketCalendar,
++                weeklyWindow: input.snapshot?.secondary)
+         }
+         return nil
+     }
+@@ -131,12 +133,17 @@ extension UsageMenuCardView.Model {
+             tokenSnapshot: input.tokenSnapshot)
+     }
+ 
++    static func showsQuotaWeekCost(for provider: UsageProvider) -> Bool {
++        provider == .codex || provider == .claude
++    }
++
+     private static func costHistoryInlineDashboard(
+         provider: UsageProvider,
+         snapshot: CostUsageTokenSnapshot,
+         comparisonPeriodsEnabled: Bool,
+         preferredCurrencyCode: String,
+-        calendar: Calendar) -> InlineUsageDashboardModel
++        calendar: Calendar,
++        weeklyWindow: RateWindow?) -> InlineUsageDashboardModel
+     {
+         let displayCurrencyCode = UsageFormatter.convertedCost(
+             0,
+@@ -204,7 +211,27 @@ extension UsageMenuCardView.Model {
+         let latest = CostUsageTokenSnapshot.latestEntry(in: snapshot.daily)
+         let usesLatestPrimary = tokenCost.primaryValue == .latestDaily
+         let primaryCostUSD = usesLatestPrimary ? latest?.costUSD : snapshot.sessionCostUSD
++        let quotaWeeks = Self.showsQuotaWeekCost(for: provider) && historyDays >= 7
++            ? snapshot.quotaWeekSummaries(
++                resetAt: CostUsageTokenSnapshot.quotaWeekReset(from: weeklyWindow),
++                windowMinutes: weeklyWindow?.windowMinutes,
++                calendar: calendar)
++            : []
++        let currentWeek = quotaWeeks.first { $0.isCurrent }
++        let insertWeekKPIs = currentWeek != nil && historyDays > 7 && snapshot.last30DaysRequests == nil
++        let relabelHistoryAsWeek = currentWeek != nil && historyDays == 7 && snapshot.last30DaysRequests == nil
++        let weekCostTitle = L("This week")
++        let weekTokenTitle = L("%@ tokens", L("This week"))
++        let weekCostValue = currentWeek?.totalCostUSD.map(convertedString) ?? "—"
++        let weekTokenValue = currentWeek?.totalTokens.map(UsageFormatter.tokenCountString) ?? "—"
++
+         var details: [String] = []
++        details.append(contentsOf: quotaWeeks.compactMap { week in
++            guard week.offset > 0, week.entryCount > 0 else { return nil }
++            return Self.quotaWeekDetailLine(
++                week: week,
++                cost: week.totalCostUSD.map(convertedString) ?? "—")
++        })
+         if comparisonPeriodsEnabled {
+             details.append(contentsOf: snapshot.comparisonSummaries().map {
+                 let label = Self.costHistoryWindowLabel(days: $0.days)
+@@ -242,28 +269,42 @@ extension UsageMenuCardView.Model {
+             "%@: %@",
+             providerName,
+             accessibilityCostLabel)
+-        var kpis = [
+-            InlineUsageDashboardModel.KPI(
+-                title: usesLatestPrimary ? L("Latest") : L("Today"),
+-                value: primaryCostUSD.map(convertedString) ?? "—",
+-                emphasis: true),
+-            .init(
+-                title: historyTitle,
+-                value: snapshot.last30DaysCostUSD
+-                    .map(convertedString) ?? "—",
+-                emphasis: false),
+-        ]
++        let todayKPI = InlineUsageDashboardModel.KPI(
++            title: usesLatestPrimary ? L("Latest") : L("Today"),
++            value: primaryCostUSD.map(convertedString) ?? "—",
++            emphasis: true)
++        let historyCostKPI = InlineUsageDashboardModel.KPI(
++            title: relabelHistoryAsWeek ? weekCostTitle : historyTitle,
++            value: relabelHistoryAsWeek
++                ? weekCostValue
++                : snapshot.last30DaysCostUSD.map(convertedString) ?? "—",
++            emphasis: relabelHistoryAsWeek)
+         let tokenHistoryKPI = InlineUsageDashboardModel.KPI(
+-            title: tokenHistoryTitle,
+-            value: snapshot.last30DaysTokens.map(UsageFormatter.tokenCountString) ?? "—",
++            title: relabelHistoryAsWeek ? weekTokenTitle : tokenHistoryTitle,
++            value: relabelHistoryAsWeek
++                ? weekTokenValue
++                : snapshot.last30DaysTokens.map(UsageFormatter.tokenCountString) ?? "—",
+             emphasis: false)
+         let trailingKPIs = Self.costHistoryTrailingKPIs(snapshot: snapshot, latest: latest)
+-        if snapshot.last30DaysRequests == nil {
+-            kpis.append(contentsOf: trailingKPIs)
+-            kpis.append(tokenHistoryKPI)
++        var kpis: [InlineUsageDashboardModel.KPI]
++        if insertWeekKPIs, let latestTokensKPI = trailingKPIs.first {
++            kpis = [
++                todayKPI,
++                .init(title: weekCostTitle, value: weekCostValue, emphasis: true),
++                latestTokensKPI,
++                .init(title: weekTokenTitle, value: weekTokenValue, emphasis: false),
++                historyCostKPI,
++                tokenHistoryKPI,
++            ]
+         } else {
+-            kpis.append(tokenHistoryKPI)
+-            kpis.append(contentsOf: trailingKPIs)
++            kpis = [todayKPI, historyCostKPI]
++            if snapshot.last30DaysRequests == nil {
++                kpis.append(contentsOf: trailingKPIs)
++                kpis.append(tokenHistoryKPI)
++            } else {
++                kpis.append(tokenHistoryKPI)
++                kpis.append(contentsOf: trailingKPIs)
++            }
+         }
+         if provider == .cursor, let meteredCostUSD = snapshot.meteredCostUSD {
+             kpis.insert(
+@@ -283,6 +324,27 @@ extension UsageMenuCardView.Model {
+         return model
+     }
+ 
++    private static func quotaWeekDetailLine(week: CostUsageQuotaWeek, cost: String) -> String {
++        let label = Self.quotaWeekHistoryLabel(offset: week.offset)
++        guard let totalTokens = week.totalTokens else { return "\(label): \(cost)" }
++        return String(
++            format: L("%@: %@ · %@ tokens"),
++            label,
++            cost,
++            UsageFormatter.tokenCountString(totalTokens))
++    }
++
++    private static func quotaWeekHistoryLabel(offset: Int) -> String {
++        switch offset {
++        case 0:
++            return L("This week")
++        case 1:
++            return L("Last week")
++        default:
++            return L("%d weeks ago", offset)
++        }
++    }
++
+     private static func costHistoryTrailingKPIs(
+         snapshot: CostUsageTokenSnapshot,
+         latest: CostUsageDailyReport.Entry?)
+diff --git a/Sources/CodexBar/Resources/ar.lproj/Localizable.strings b/Sources/CodexBar/Resources/ar.lproj/Localizable.strings
+index c33125313..686c1ef7e 100644
+--- a/Sources/CodexBar/Resources/ar.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/ar.lproj/Localizable.strings
+@@ -888,6 +888,8 @@
+ "usage_percent_suffix_used" = "مستخدم";
+ "Store multiple DeepSeek API keys." = "خزن عدة مفاتيح DeepSeek API.";
+ "This week" = "هذا الأسبوع";
++"Last week" = "الأسبوع الماضي";
++"%d weeks ago" = "قبل %d أسابيع";
+ "Week" = "الأسبوع";
+ "Month" = "الشهر";
+ "Models" = "النماذج";
+diff --git a/Sources/CodexBar/Resources/ca.lproj/Localizable.strings b/Sources/CodexBar/Resources/ca.lproj/Localizable.strings
+index ac18cfc23..45e5ca5c0 100644
+--- a/Sources/CodexBar/Resources/ca.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/ca.lproj/Localizable.strings
+@@ -895,6 +895,8 @@
+ "Latest billing day" = "Últim dia de facturació";
+ "Latest billing day (%@)" = "Últim dia de facturació (%@)";
+ "This week" = "Aquesta setmana";
++"Last week" = "La setmana passada";
++"%d weeks ago" = "fa %d setmanes";
+ "This month" = "Aquest mes";
+ "Week" = "Setmana";
+ "Month" = "Mes";
+diff --git a/Sources/CodexBar/Resources/de.lproj/Localizable.strings b/Sources/CodexBar/Resources/de.lproj/Localizable.strings
+index c6513ef16..1dcadd4d7 100644
+--- a/Sources/CodexBar/Resources/de.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/de.lproj/Localizable.strings
+@@ -880,6 +880,8 @@
+ "usage_percent_suffix_used" = "verbraucht";
+ "Store multiple DeepSeek API keys." = "Speichern Sie mehrere DeepSeek-API-Schlüssel.";
+ "This week" = "Diese Woche";
++"Last week" = "Letzte Woche";
++"%d weeks ago" = "vor %d Wochen";
+ "Week" = "Woche";
+ "Month" = "Monat";
+ "Models" = "Modelle";
+diff --git a/Sources/CodexBar/Resources/en.lproj/Localizable.strings b/Sources/CodexBar/Resources/en.lproj/Localizable.strings
+index faa1833bd..137aaff65 100644
+--- a/Sources/CodexBar/Resources/en.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/en.lproj/Localizable.strings
+@@ -868,6 +868,8 @@
+ "usage_percent_suffix_used" = "used";
+ "Store multiple DeepSeek API keys." = "Store multiple DeepSeek API keys.";
+ "This week" = "This week";
++"Last week" = "Last week";
++"%d weeks ago" = "%d weeks ago";
+ "Week" = "Week";
+ "Month" = "Month";
+ "Models" = "Models";
+diff --git a/Sources/CodexBar/Resources/es.lproj/Localizable.strings b/Sources/CodexBar/Resources/es.lproj/Localizable.strings
+index bd6f669e8..28ff1af76 100644
+--- a/Sources/CodexBar/Resources/es.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/es.lproj/Localizable.strings
+@@ -897,6 +897,8 @@
+ "Latest billing day" = "Último día de facturación";
+ "Latest billing day (%@)" = "Último día de facturación (%@)";
+ "This week" = "Esta semana";
++"Last week" = "La semana pasada";
++"%d weeks ago" = "hace %d semanas";
+ "This month" = "Este mes";
+ "Week" = "Semana";
+ "Month" = "Mes";
+diff --git a/Sources/CodexBar/Resources/fa.lproj/Localizable.strings b/Sources/CodexBar/Resources/fa.lproj/Localizable.strings
+index 1acd3f717..b5c1ce3a0 100644
+--- a/Sources/CodexBar/Resources/fa.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/fa.lproj/Localizable.strings
+@@ -888,6 +888,8 @@
+ "usage_percent_suffix_used" = "استفاده شده";
+ "Store multiple DeepSeek API keys." = "چند کلید DeepSeek API را ذخیره کنید.";
+ "This week" = "این هفته";
++"Last week" = "هفته گذشته";
++"%d weeks ago" = "%d هفته پیش";
+ "Week" = "هفته";
+ "Month" = "ماه";
+ "Models" = "مدل ها";
+diff --git a/Sources/CodexBar/Resources/fr.lproj/Localizable.strings b/Sources/CodexBar/Resources/fr.lproj/Localizable.strings
+index 313a6e9b2..2e81f0361 100644
+--- a/Sources/CodexBar/Resources/fr.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/fr.lproj/Localizable.strings
+@@ -882,6 +882,8 @@
+ "usage_percent_suffix_used" = "utilisé";
+ "Store multiple DeepSeek API keys." = "Stockez plusieurs clés API DeepSeek.";
+ "This week" = "Cette semaine";
++"Last week" = "La semaine dernière";
++"%d weeks ago" = "il y a %d semaines";
+ "Week" = "Semaine";
+ "Month" = "Mois";
+ "Models" = "Modèles";
+diff --git a/Sources/CodexBar/Resources/gl.lproj/Localizable.strings b/Sources/CodexBar/Resources/gl.lproj/Localizable.strings
+index 1c903b028..edb994f61 100644
+--- a/Sources/CodexBar/Resources/gl.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/gl.lproj/Localizable.strings
+@@ -884,6 +884,8 @@
+ "Latest billing day" = "Último día de facturación";
+ "Latest billing day (%@)" = "Último día de facturación (%@)";
+ "This week" = "Esta semana";
++"Last week" = "A semana pasada";
++"%d weeks ago" = "hai %d semanas";
+ "This month" = "Este mes";
+ "Week" = "Semana";
+ "Month" = "Mes";
+diff --git a/Sources/CodexBar/Resources/id.lproj/Localizable.strings b/Sources/CodexBar/Resources/id.lproj/Localizable.strings
+index fb0e55ddb..1c0345dec 100644
+--- a/Sources/CodexBar/Resources/id.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/id.lproj/Localizable.strings
+@@ -890,6 +890,8 @@
+ "usage_percent_suffix_used" = "terpakai";
+ "Store multiple DeepSeek API keys." = "Simpan beberapa kunci API DeepSeek.";
+ "This week" = "Minggu ini";
++"Last week" = "Minggu lalu";
++"%d weeks ago" = "%d minggu lalu";
+ "Week" = "Minggu";
+ "Month" = "Bulan";
+ "Models" = "Model";
+diff --git a/Sources/CodexBar/Resources/it.lproj/Localizable.strings b/Sources/CodexBar/Resources/it.lproj/Localizable.strings
+index e9c32b825..230f7d288 100644
+--- a/Sources/CodexBar/Resources/it.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/it.lproj/Localizable.strings
+@@ -890,6 +890,8 @@
+ "usage_percent_suffix_used" = "usato";
+ "Store multiple DeepSeek API keys." = "Memorizza più chiavi API DeepSeek.";
+ "This week" = "Questa settimana";
++"Last week" = "La settimana scorsa";
++"%d weeks ago" = "%d settimane fa";
+ "Week" = "Settimana";
+ "Month" = "Mese";
+ "Models" = "Modelli";
+diff --git a/Sources/CodexBar/Resources/ja.lproj/Localizable.strings b/Sources/CodexBar/Resources/ja.lproj/Localizable.strings
+index cb4639068..b292ced86 100644
+--- a/Sources/CodexBar/Resources/ja.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/ja.lproj/Localizable.strings
+@@ -879,6 +879,8 @@
+ "usage_percent_suffix_used" = "使用済み";
+ "Store multiple DeepSeek API keys." = "複数の DeepSeek API キーを保存します。";
+ "This week" = "今週";
++"Last week" = "先週";
++"%d weeks ago" = "%d週間前";
+ "Week" = "週";
+ "Month" = "月";
+ "Models" = "モデル";
+diff --git a/Sources/CodexBar/Resources/ko.lproj/Localizable.strings b/Sources/CodexBar/Resources/ko.lproj/Localizable.strings
+index 1fa01aee1..03e73769d 100644
+--- a/Sources/CodexBar/Resources/ko.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/ko.lproj/Localizable.strings
+@@ -854,6 +854,8 @@
+ "usage_percent_suffix_used" = "사용";
+ "Store multiple DeepSeek API keys." = "여러 DeepSeek API 키를 저장합니다.";
+ "This week" = "이번 주";
++"Last week" = "지난주";
++"%d weeks ago" = "%d주 전";
+ "Week" = "주";
+ "Month" = "월";
+ "Models" = "모델";
+diff --git a/Sources/CodexBar/Resources/nl.lproj/Localizable.strings b/Sources/CodexBar/Resources/nl.lproj/Localizable.strings
+index 9ee245f24..e2d5de453 100644
+--- a/Sources/CodexBar/Resources/nl.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/nl.lproj/Localizable.strings
+@@ -882,6 +882,8 @@
+ "usage_percent_suffix_used" = "gebruikt";
+ "Store multiple DeepSeek API keys." = "Bewaar meerdere DeepSeek API-sleutels.";
+ "This week" = "Deze week";
++"Last week" = "Vorige week";
++"%d weeks ago" = "%d weken geleden";
+ "Week" = "Week";
+ "Month" = "Maand";
+ "Models" = "Modellen";
+diff --git a/Sources/CodexBar/Resources/pl.lproj/Localizable.strings b/Sources/CodexBar/Resources/pl.lproj/Localizable.strings
+index 2e48d3388..bed61b31d 100644
+--- a/Sources/CodexBar/Resources/pl.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/pl.lproj/Localizable.strings
+@@ -890,6 +890,8 @@
+ "usage_percent_suffix_used" = "wykorzystano";
+ "Store multiple DeepSeek API keys." = "Przechowuj wiele kluczy API DeepSeek.";
+ "This week" = "Ten tydzień";
++"Last week" = "Zeszły tydzień";
++"%d weeks ago" = "%d tyg. temu";
+ "Week" = "Tydzień";
+ "Month" = "Miesiąc";
+ "Models" = "Modele";
+diff --git a/Sources/CodexBar/Resources/pt-BR.lproj/Localizable.strings b/Sources/CodexBar/Resources/pt-BR.lproj/Localizable.strings
+index 43bd7a2ff..0e856aeff 100644
+--- a/Sources/CodexBar/Resources/pt-BR.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/pt-BR.lproj/Localizable.strings
+@@ -879,6 +879,8 @@
+ "usage_percent_suffix_used" = "usado";
+ "Store multiple DeepSeek API keys." = "Armazena várias chaves de API do DeepSeek.";
+ "This week" = "Esta semana";
++"Last week" = "Semana passada";
++"%d weeks ago" = "%d semanas atrás";
+ "Week" = "Semana";
+ "Month" = "Mês";
+ "Models" = "Modelos";
+diff --git a/Sources/CodexBar/Resources/ru.lproj/Localizable.strings b/Sources/CodexBar/Resources/ru.lproj/Localizable.strings
+index e6596ee17..bcfe8b9c5 100644
+--- a/Sources/CodexBar/Resources/ru.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/ru.lproj/Localizable.strings
+@@ -883,6 +883,8 @@
+ "usage_percent_suffix_used" = "использовано";
+ "Store multiple DeepSeek API keys." = "Хранить несколько API-ключей DeepSeek.";
+ "This week" = "На этой неделе";
++"Last week" = "Прошлая неделя";
++"%d weeks ago" = "%d нед. назад";
+ "Week" = "неделя";
+ "Month" = "Месяц";
+ "Models" = "Модели";
+diff --git a/Sources/CodexBar/Resources/sv.lproj/Localizable.strings b/Sources/CodexBar/Resources/sv.lproj/Localizable.strings
+index e7be684c2..7d1afad3d 100644
+--- a/Sources/CodexBar/Resources/sv.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/sv.lproj/Localizable.strings
+@@ -881,6 +881,8 @@
+ "usage_percent_suffix_used" = "förbrukat";
+ "Store multiple DeepSeek API keys." = "Spara flera DeepSeek-API-nycklar.";
+ "This week" = "Den här veckan";
++"Last week" = "Förra veckan";
++"%d weeks ago" = "för %d veckor sedan";
+ "Week" = "Vecka";
+ "Month" = "Månad";
+ "Models" = "Modeller";
+diff --git a/Sources/CodexBar/Resources/th.lproj/Localizable.strings b/Sources/CodexBar/Resources/th.lproj/Localizable.strings
+index b732e17b4..34e7ac21c 100644
+--- a/Sources/CodexBar/Resources/th.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/th.lproj/Localizable.strings
+@@ -888,6 +888,8 @@
+ "usage_percent_suffix_used" = "ใช้แล้ว";
+ "Store multiple DeepSeek API keys." = "จัดเก็บปุ่ม DeepSeek API หลายปุ่ม";
+ "This week" = "สัปดาห์นี้";
++"Last week" = "สัปดาห์ที่แล้ว";
++"%d weeks ago" = "%d สัปดาห์ที่แล้ว";
+ "Week" = "สัปดาห์";
+ "Month" = "เดือน";
+ "Models" = "โมเดล";
+diff --git a/Sources/CodexBar/Resources/tr.lproj/Localizable.strings b/Sources/CodexBar/Resources/tr.lproj/Localizable.strings
+index a05d3c85b..84a12e7cc 100644
+--- a/Sources/CodexBar/Resources/tr.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/tr.lproj/Localizable.strings
+@@ -884,6 +884,8 @@
+ "usage_percent_suffix_used" = "kullanıldı";
+ "Store multiple DeepSeek API keys." = "Birden fazla DeepSeek API anahtarı depolayın.";
+ "This week" = "Bu hafta";
++"Last week" = "Geçen hafta";
++"%d weeks ago" = "%d hafta önce";
+ "Week" = "Hafta";
+ "Month" = "Ay";
+ "Models" = "Modeller";
+diff --git a/Sources/CodexBar/Resources/uk.lproj/Localizable.strings b/Sources/CodexBar/Resources/uk.lproj/Localizable.strings
+index 1199b65df..45d74d292 100644
+--- a/Sources/CodexBar/Resources/uk.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/uk.lproj/Localizable.strings
+@@ -882,6 +882,8 @@
+ "usage_percent_suffix_used" = "використовується";
+ "Store multiple DeepSeek API keys." = "Зберігайте кілька ключів DeepSeek API.";
+ "This week" = "Цього тижня";
++"Last week" = "Минулого тижня";
++"%d weeks ago" = "%d тиж. тому";
+ "Week" = "тиждень";
+ "Month" = "місяць";
+ "Models" = "Моделі";
+diff --git a/Sources/CodexBar/Resources/vi.lproj/Localizable.strings b/Sources/CodexBar/Resources/vi.lproj/Localizable.strings
+index 77c0dc62c..bd255173b 100644
+--- a/Sources/CodexBar/Resources/vi.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/vi.lproj/Localizable.strings
+@@ -878,6 +878,8 @@
+ "usage_percent_suffix_used" = "đã sử dụng";
+ "Store multiple DeepSeek API keys." = "Lưu trữ nhiều khóa DeepSeek API.";
+ "This week" = "Tuần này";
++"Last week" = "Tuần trước";
++"%d weeks ago" = "%d tuần trước";
+ "Week" = "Tuần";
+ "Month" = "Tháng";
+ "Models" = "Mô hình";
+diff --git a/Sources/CodexBar/Resources/zh-Hans.lproj/Localizable.strings b/Sources/CodexBar/Resources/zh-Hans.lproj/Localizable.strings
+index 634f14adb..d2f74aa2d 100644
+--- a/Sources/CodexBar/Resources/zh-Hans.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/zh-Hans.lproj/Localizable.strings
+@@ -844,6 +844,8 @@
+ "usage_percent_suffix_used" = "已使用";
+ "Store multiple DeepSeek API keys." = "存储多个 DeepSeek API 密钥。";
+ "This week" = "本周";
++"Last week" = "上周";
++"%d weeks ago" = "%d 周前";
+ "Week" = "本周";
+ "Month" = "本月";
+ "Models" = "模型";
+diff --git a/Sources/CodexBar/Resources/zh-Hant.lproj/Localizable.strings b/Sources/CodexBar/Resources/zh-Hant.lproj/Localizable.strings
+index c27ba25fb..92124d79e 100644
+--- a/Sources/CodexBar/Resources/zh-Hant.lproj/Localizable.strings
++++ b/Sources/CodexBar/Resources/zh-Hant.lproj/Localizable.strings
+@@ -898,6 +898,8 @@
+ "Latest billing day" = "最新帳單日";
+ "Latest billing day (%@)" = "最新帳單日（%@）";
+ "This week" = "本週";
++"Last week" = "上週";
++"%d weeks ago" = "%d 週前";
+ "Week" = "週";
+ "Month" = "月";
+ "Models" = "模型";
+diff --git a/Sources/CodexBarCore/CostUsageModels.swift b/Sources/CodexBarCore/CostUsageModels.swift
+index 7808f4b36..e408df341 100644
+--- a/Sources/CodexBarCore/CostUsageModels.swift
++++ b/Sources/CodexBarCore/CostUsageModels.swift
+@@ -50,6 +50,40 @@ public struct CostUsageWindowSummary: Sendable, Equatable {
+     }
+ }
+ 
++/// A 7-day quota window derived from local daily cost history.
++///
++/// When `resetAt` is known, windows line up with the live Weekly bar rather than a rolling
++/// calendar "last 7 days". Daily logs cannot split a mid-day reset, so a boundary day is
++/// counted in every window it overlaps.
++public struct CostUsageQuotaWeek: Sendable, Equatable {
++    public let offset: Int
++    public let start: Date
++    public let end: Date
++    public let totalTokens: Int?
++    public let totalCostUSD: Double?
++    public let entryCount: Int
++
++    public var isCurrent: Bool {
++        self.offset == 0
++    }
++
++    public init(
++        offset: Int,
++        start: Date,
++        end: Date,
++        totalTokens: Int?,
++        totalCostUSD: Double?,
++        entryCount: Int)
++    {
++        self.offset = offset
++        self.start = start
++        self.end = end
++        self.totalTokens = totalTokens
++        self.totalCostUSD = totalCostUSD
++        self.entryCount = entryCount
++    }
++}
++
+ /// An estimated local Codex conversation total derived from one session log.
+ /// This is intentionally distinct from account-level billing or quota data.
+ public struct CostUsageSessionBreakdown: Sendable, Equatable, Identifiable {
+@@ -244,6 +278,114 @@ public struct CostUsageTokenSnapshot: Sendable, Equatable {
+             .map { self.summary(forLastDays: $0, calendar: calendar) }
+     }
+ 
++    public static let quotaWeekMinutes = 7 * 24 * 60
++
++    /// Buckets daily cost rows into consecutive 7-day windows.
++    ///
++    /// Pass the live Weekly `resetsAt` / `windowMinutes` to match the quota bar. When reset
++    /// metadata is missing, windows fall back to rolling calendar weeks ending tomorrow.
++    public func quotaWeekSummaries(
++        resetAt: Date?,
++        windowMinutes: Int? = nil,
++        weekCount: Int = 4,
++        now: Date? = nil,
++        calendar: Calendar = .current) -> [CostUsageQuotaWeek]
++    {
++        let calendar = CostUsageLocalDay.gregorianCalendar(matching: calendar)
++        let now = now ?? self.updatedAt
++        let duration = TimeInterval(Self.normalizedQuotaWeekMinutes(windowMinutes) * 60)
++        let currentEnd = Self.currentQuotaWeekEnd(
++            resetAt: resetAt,
++            duration: duration,
++            now: now,
++            calendar: calendar)
++        let historyStart = calendar.date(
++            byAdding: .day,
++            value: -(max(1, self.historyDays) - 1),
++            to: calendar.startOfDay(for: self.updatedAt)) ?? self.updatedAt
++        let indexedDays: [(start: Date, end: Date, entry: CostUsageDailyReport.Entry)] = self.daily
++            .compactMap { entry in
++                guard let dayKey = Self.localDayKey(for: entry.date, calendar: calendar),
++                      let dayStart = CostUsageLocalDay.date(fromKey: dayKey, calendar: calendar),
++                      let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart)
++                else { return nil }
++                return (dayStart, dayEnd, entry)
++            }
++
++        let count = max(1, min(weekCount, 8))
++        var weeks: [CostUsageQuotaWeek] = []
++        weeks.reserveCapacity(count)
++        for offset in 0..<count {
++            let end = currentEnd.addingTimeInterval(-duration * TimeInterval(offset))
++            let start = end.addingTimeInterval(-duration)
++            if offset > 0, end <= historyStart {
++                continue
++            }
++            let entries = indexedDays.compactMap { day -> CostUsageDailyReport.Entry? in
++                guard day.start < end, day.end > start else { return nil }
++                return day.entry
++            }
++            let costs = entries.compactMap(\.costUSD)
++            let tokens = entries.compactMap(\.totalTokens)
++            weeks.append(CostUsageQuotaWeek(
++                offset: offset,
++                start: start,
++                end: end,
++                totalTokens: Self.summedInts(tokens),
++                totalCostUSD: costs.isEmpty ? nil : costs.reduce(0, +),
++                entryCount: entries.count))
++        }
++        return weeks
++    }
++
++    public static func normalizedQuotaWeekMinutes(_ windowMinutes: Int?) -> Int {
++        let week = self.quotaWeekMinutes
++        guard let windowMinutes, (week - 24 * 60)...(week + 24 * 60) ~= windowMinutes else {
++            return week
++        }
++        return windowMinutes
++    }
++
++    public static func quotaWeekReset(from window: RateWindow?) -> Date? {
++        guard let window else { return nil }
++        if let minutes = window.windowMinutes {
++            let week = self.quotaWeekMinutes
++            guard (week - 24 * 60)...(week + 24 * 60) ~= minutes else { return nil }
++        }
++        return window.resetsAt
++    }
++
++    private static func currentQuotaWeekEnd(
++        resetAt: Date?,
++        duration: TimeInterval,
++        now: Date,
++        calendar: Calendar) -> Date
++    {
++        guard duration > 0 else {
++            return calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: now)) ?? now
++        }
++        if let resetAt {
++            if resetAt > now {
++                return resetAt
++            }
++            let elapsed = now.timeIntervalSince(resetAt)
++            let periods = floor(elapsed / duration) + 1
++            return resetAt.addingTimeInterval(periods * duration)
++        }
++        return calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: now)) ?? now
++    }
++
++    private static func summedInts(_ values: [Int]) -> Int? {
++        guard !values.isEmpty else { return nil }
++        var sum = 0
++        for value in values {
++            let (result, overflowed) = sum.addingReportingOverflow(value)
++            if overflowed { return nil }
++            sum = result
++        }
++        return sum
++    }
++
+     public static func latestEntry(in entries: [CostUsageDailyReport.Entry]) -> CostUsageDailyReport.Entry? {
+         entries.compactMap { entry -> (entry: CostUsageDailyReport.Entry, date: Date)? in
+             guard let date = CostUsageDateParser.parse(entry.date) else { return nil }
+@@ -1265,4 +1407,17 @@ enum CostUsageLocalDay {
+         let day = components.day ?? 0
+         return String(format: "%04d-%02d-%02d", year, month, day)
+     }
++
++    static func date(fromKey key: String, calendar: Calendar = .current) -> Date? {
++        let parts = key.split(separator: "-")
++        guard parts.count == 3,
++              let year = Int(parts[0]),
++              let month = Int(parts[1]),
++              let day = Int(parts[2])
++        else { return nil }
++        return Self.gregorianCalendar(matching: calendar).date(from: DateComponents(
++            year: year,
++            month: month,
++            day: day))
++    }
+ }
+diff --git a/Tests/CodexBarTests/InlineCostHistoryDashboardLabelTests.swift b/Tests/CodexBarTests/InlineCostHistoryDashboardLabelTests.swift
+index 2947a3131..7ad6e392e 100644
+--- a/Tests/CodexBarTests/InlineCostHistoryDashboardLabelTests.swift
++++ b/Tests/CodexBarTests/InlineCostHistoryDashboardLabelTests.swift
+@@ -173,12 +173,12 @@ struct InlineCostHistoryDashboardLabelTests {
+ 
+         let sevenDays = makeModel(historyDays: 7)
+         #expect(sevenDays.inlineUsageDashboard?.kpis.map(\.title) == [
+-            "Today", "Last 7 days Cost", "Latest tokens", "Last 7 days tokens",
++            "Today", "This week", "Latest tokens", "This week tokens",
+         ])
+ 
+         let thirtyDays = makeModel(historyDays: 30)
+         #expect(thirtyDays.inlineUsageDashboard?.kpis.map(\.title) == [
+-            "Today", "30d cost", "Latest tokens", "30d tokens",
++            "Today", "This week", "Latest tokens", "This week tokens", "30d cost", "30d tokens",
+         ])
+     }
+ 
+@@ -228,7 +228,7 @@ struct InlineCostHistoryDashboardLabelTests {
+             now: now))
+ 
+         #expect(model.inlineUsageDashboard?.kpis.map(\.title) == [
+-            "Today", "This month", "Latest tokens", "This month tokens",
++            "Today", "This week", "Latest tokens", "This week tokens", "This month", "This month tokens",
+         ])
+     }
+ 
+@@ -287,8 +287,10 @@ struct InlineCostHistoryDashboardLabelTests {
+         #expect(dashboard.accessibilityLabel == "Codex: 30d cost")
+         #expect(dashboard.kpis.map(\.title) == [
+             "Today",
+-            "30d",
++            "This week",
+             "Latest tokens",
++            "This week tokens",
++            "30d",
+             "30d tokens",
+         ])
+         #expect(dashboard.detailLines == [
+@@ -471,4 +473,109 @@ struct InlineCostHistoryDashboardLabelTests {
+         #expect(model.inlineUsageDashboard == nil)
+         #expect(model.providerDetails.last?.chart?.unit == "tokens")
+     }
++
++    @Test
++    func `codex and claude show this week KPIs and previous week history`() throws {
++        var calendar = Calendar(identifier: .gregorian)
++        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
++        let now = try #require(calendar.date(from: DateComponents(
++            timeZone: calendar.timeZone,
++            year: 2026,
++            month: 7,
++            day: 15,
++            hour: 12)))
++        let resetAt = try #require(calendar.date(from: DateComponents(
++            timeZone: calendar.timeZone,
++            year: 2026,
++            month: 7,
++            day: 18,
++            hour: 15)))
++        let metadata = try #require(ProviderDefaults.metadata[.codex])
++        let tokenSnapshot = CostUsageTokenSnapshot(
++            sessionTokens: 1_000,
++            sessionCostUSD: 10,
++            last30DaysTokens: 1_400,
++            last30DaysCostUSD: 14,
++            historyDays: 30,
++            daily: [
++                CostUsageDailyReport.Entry(
++                    date: "2026-07-08",
++                    inputTokens: 300,
++                    outputTokens: 100,
++                    totalTokens: 400,
++                    costUSD: 4,
++                    modelsUsed: ["gpt-5.4"],
++                    modelBreakdowns: [
++                        CostUsageDailyReport.ModelBreakdown(
++                            modelName: "gpt-5.4",
++                            costUSD: 4,
++                            totalTokens: 400),
++                    ]),
++                CostUsageDailyReport.Entry(
++                    date: "2026-07-13",
++                    inputTokens: 800,
++                    outputTokens: 200,
++                    totalTokens: 1_000,
++                    costUSD: 10,
++                    modelsUsed: ["gpt-5.4"],
++                    modelBreakdowns: [
++                        CostUsageDailyReport.ModelBreakdown(
++                            modelName: "gpt-5.4",
++                            costUSD: 10,
++                            totalTokens: 1_000),
++                    ]),
++            ],
++            updatedAt: now)
++
++        let model = UsageMenuCardView.Model.make(.init(
++            provider: .codex,
++            metadata: metadata,
++            snapshot: UsageSnapshot(
++                primary: RateWindow(
++                    usedPercent: 20,
++                    windowMinutes: 5 * 60,
++                    resetsAt: now.addingTimeInterval(4 * 3600),
++                    resetDescription: nil),
++                secondary: RateWindow(
++                    usedPercent: 50,
++                    windowMinutes: CostUsageTokenSnapshot.quotaWeekMinutes,
++                    resetsAt: resetAt,
++                    resetDescription: nil),
++                updatedAt: now),
++            credits: nil,
++            creditsError: nil,
++            dashboard: nil,
++            dashboardError: nil,
++            tokenSnapshot: tokenSnapshot,
++            tokenError: nil,
++            account: AccountInfo(email: nil, plan: nil),
++            isRefreshing: false,
++            lastError: nil,
++            usageBarsShowUsed: false,
++            resetTimeDisplayStyle: .countdown,
++            tokenCostUsageEnabled: true,
++            showOptionalCreditsAndExtraUsage: true,
++            hidePersonalInfo: false,
++            costUsageBucketCalendar: calendar,
++            now: now))
++
++        let dashboard = try #require(model.inlineUsageDashboard)
++        #expect(dashboard.kpis.map(\.title) == [
++            "Today",
++            "This week",
++            "Latest tokens",
++            "This week tokens",
++            "30d",
++            "30d tokens",
++        ])
++        #expect(dashboard.kpis.map(\.value) == [
++            "$10.00",
++            "$10.00",
++            "1K",
++            "1K",
++            "$14.00",
++            "1.4K",
++        ])
++        #expect(dashboard.detailLines.contains("Last week: $4.00 · 400 tokens"))
++    }
+ }
+diff --git a/TestsLinux/CostUsageQuotaWeekLinuxTests.swift b/TestsLinux/CostUsageQuotaWeekLinuxTests.swift
+new file mode 100644
+index 000000000..0af012c4d
+--- /dev/null
++++ b/TestsLinux/CostUsageQuotaWeekLinuxTests.swift
+@@ -0,0 +1,142 @@
++import CodexBarCore
++import Foundation
++import Testing
++
++struct CostUsageQuotaWeekLinuxTests {
++    @Test
++    func `rolling weeks match last 7 calendar days when reset is unknown`() {
++        let snapshot = Self.snapshot(
++            historyDays: 30,
++            daily: [
++                Self.entry(day: "2026-07-01", cost: 1, tokens: 100),
++                Self.entry(day: "2026-07-08", cost: 3, tokens: 300),
++                Self.entry(day: "2026-07-09", cost: 2, tokens: 200),
++                Self.entry(day: "2026-07-15", cost: 5, tokens: 500),
++            ],
++            updatedAt: Self.utcDate(year: 2026, month: 7, day: 15, hour: 12))
++
++        let weeks = snapshot.quotaWeekSummaries(resetAt: nil, calendar: Self.utcCalendar)
++        let current = weeks.first { $0.offset == 0 }
++        let last = weeks.first { $0.offset == 1 }
++
++        #expect(current?.totalCostUSD == 7)
++        #expect(current?.totalTokens == 700)
++        #expect(current?.entryCount == 2)
++        #expect(last?.totalCostUSD == 3)
++        #expect(last?.totalTokens == 300)
++        #expect(weeks.first { $0.offset == 2 }?.totalCostUSD == 1)
++    }
++
++    @Test
++    func `quota weeks align to the live weekly reset instead of calendar last 7 days`() {
++        let now = Self.utcDate(year: 2026, month: 7, day: 15, hour: 12)
++        let resetAt = Self.utcDate(year: 2026, month: 7, day: 18, hour: 15)
++        let snapshot = Self.snapshot(
++            historyDays: 30,
++            daily: [
++                Self.entry(day: "2026-07-08", cost: 4, tokens: 400),
++                Self.entry(day: "2026-07-13", cost: 10, tokens: 1_000),
++                Self.entry(day: "2026-07-20", cost: 99, tokens: 9_900),
++            ],
++            updatedAt: now)
++
++        let weeks = snapshot.quotaWeekSummaries(
++            resetAt: resetAt,
++            windowMinutes: CostUsageTokenSnapshot.quotaWeekMinutes,
++            calendar: Self.utcCalendar)
++        let current = weeks.first { $0.isCurrent }
++        let previous = weeks.first { $0.offset == 1 }
++
++        #expect(current?.totalCostUSD == 10)
++        #expect(current?.totalTokens == 1_000)
++        #expect(previous?.totalCostUSD == 4)
++        #expect(previous?.totalTokens == 400)
++        #expect(weeks.contains { $0.totalCostUSD == 99 } == false)
++    }
++
++    @Test
++    func `stale reset advances by whole weeks until it covers now`() {
++        let now = Self.utcDate(year: 2026, month: 7, day: 15, hour: 12)
++        let staleReset = Self.utcDate(year: 2026, month: 7, day: 4, hour: 15)
++        let snapshot = Self.snapshot(
++            historyDays: 30,
++            daily: [
++                Self.entry(day: "2026-07-08", cost: 3, tokens: 300),
++                Self.entry(day: "2026-07-13", cost: 8, tokens: 800),
++            ],
++            updatedAt: now)
++
++        let weeks = snapshot.quotaWeekSummaries(resetAt: staleReset, calendar: Self.utcCalendar)
++        #expect(weeks.first?.isCurrent == true)
++        #expect(weeks.first?.end > now)
++        #expect(weeks.first?.totalCostUSD == 8)
++        #expect(weeks.first { $0.offset == 1 }?.totalCostUSD == 3)
++    }
++
++    @Test
++    func `historical weeks outside the scanned history are omitted`() {
++        let snapshot = Self.snapshot(
++            historyDays: 7,
++            daily: [Self.entry(day: "2026-07-15", cost: 5, tokens: 50)],
++            updatedAt: Self.utcDate(year: 2026, month: 7, day: 15, hour: 12))
++
++        let weeks = snapshot.quotaWeekSummaries(resetAt: nil, calendar: Self.utcCalendar)
++        #expect(weeks.map(\.offset) == [0])
++        #expect(weeks.first?.totalCostUSD == 5)
++    }
++
++    @Test
++    func `session window minutes are ignored for weekly alignment`() {
++        let session = RateWindow(
++            usedPercent: 10,
++            windowMinutes: 5 * 60,
++            resetsAt: Self.utcDate(year: 2026, month: 7, day: 15, hour: 18),
++            resetDescription: nil)
++        #expect(CostUsageTokenSnapshot.quotaWeekReset(from: session) == nil)
++        #expect(CostUsageTokenSnapshot.normalizedQuotaWeekMinutes(session.windowMinutes)
++            == CostUsageTokenSnapshot.quotaWeekMinutes)
++    }
++
++    private static func snapshot(
++        historyDays: Int,
++        daily: [CostUsageDailyReport.Entry],
++        updatedAt: Date) -> CostUsageTokenSnapshot
++    {
++        CostUsageTokenSnapshot(
++            sessionTokens: daily.last?.totalTokens,
++            sessionCostUSD: daily.last?.costUSD,
++            last30DaysTokens: daily.compactMap(\.totalTokens).reduce(0, +),
++            last30DaysCostUSD: daily.compactMap(\.costUSD).reduce(0, +),
++            historyDays: historyDays,
++            daily: daily,
++            updatedAt: updatedAt)
++    }
++
++    private static func entry(day: String, cost: Double, tokens: Int) -> CostUsageDailyReport.Entry {
++        CostUsageDailyReport.Entry(
++            date: day,
++            inputTokens: nil,
++            outputTokens: nil,
++            totalTokens: tokens,
++            costUSD: cost,
++            modelsUsed: nil,
++            modelBreakdowns: nil)
++    }
++
++    private static func utcDate(year: Int, month: Int, day: Int, hour: Int) -> Date {
++        var components = DateComponents()
++        components.calendar = self.utcCalendar
++        components.timeZone = TimeZone(secondsFromGMT: 0)
++        components.year = year
++        components.month = month
++        components.day = day
++        components.hour = hour
++        return components.date!
++    }
++
++    private static var utcCalendar: Calendar {
++        var calendar = Calendar(identifier: .gregorian)
++        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
++        return calendar
++    }
++}
+-- 
+2.43.0
+
