@@ -165,7 +165,7 @@ extension StatusItemController {
             preferredCurrencyCode: self.settings.preferredCurrencyCode,
             costUsageBucketCalendar: self.settings.costUsageBucketCalendar,
             now: now,
-            observedWeeklyNextResets: self.observedWeeklyNextResets(
+            observedWeeklyResets: self.observedWeeklyResets(
                 for: target,
                 snapshot: snapshot,
                 historySelection: historySelectionOverride))
@@ -289,15 +289,15 @@ extension StatusItemController {
         AccountInfo(email: account.email, plan: account.workspaceLabel)
     }
 
-    private func observedWeeklyNextResets(
+    private func observedWeeklyResets(
         for provider: UsageProvider,
         snapshot: UsageSnapshot?,
-        historySelection: PlanUtilizationHistorySelection?) -> [Date]
+        historySelection: PlanUtilizationHistorySelection?) -> [CostUsageQuotaResetObservation]
     {
         guard ProviderDescriptorRegistry.descriptor(for: provider).presentation.menuCard.showsQuotaWeekCost else {
             return []
         }
-        return self.store.weeklyQuotaWindowResetDates(
+        return self.store.weeklyQuotaWindowResetObservations(
             for: provider,
             snapshot: snapshot,
             historySelection: historySelection)

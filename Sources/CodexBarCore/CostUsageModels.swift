@@ -63,6 +63,10 @@ public struct CostUsageQuotaWeek: Sendable, Equatable {
     public let totalTokens: Int?
     public let totalCostUSD: Double?
     public let entryCount: Int
+    /// Completeness within the scanned local source, not account-wide coverage.
+    public let tokensAreComplete: Bool
+    public let costIsComplete: Bool
+    public let boundariesAreEstimated: Bool
 
     public var isCurrent: Bool {
         self.offset == 0
@@ -80,7 +84,10 @@ public struct CostUsageQuotaWeek: Sendable, Equatable {
         end: Date,
         totalTokens: Int?,
         totalCostUSD: Double?,
-        entryCount: Int)
+        entryCount: Int,
+        tokensAreComplete: Bool = true,
+        costIsComplete: Bool = true,
+        boundariesAreEstimated: Bool = true)
     {
         self.offset = offset
         self.start = start
@@ -88,6 +95,9 @@ public struct CostUsageQuotaWeek: Sendable, Equatable {
         self.totalTokens = totalTokens
         self.totalCostUSD = totalCostUSD
         self.entryCount = entryCount
+        self.tokensAreComplete = tokensAreComplete
+        self.costIsComplete = costIsComplete
+        self.boundariesAreEstimated = boundariesAreEstimated
     }
 }
 

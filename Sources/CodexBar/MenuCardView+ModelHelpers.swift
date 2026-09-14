@@ -488,7 +488,7 @@ extension UsageMenuCardView.Model {
                     $0.id == $1.id && $0.label == $1.label
                 } &&
                 zip(current.quotaWindows, candidate.quotaWindows).allSatisfy {
-                    $0.title == $1.title && $0.range == $1.range
+                    $0.title == $1.title && $0.range == $1.range && $0.note == $1.note
                 }
         default:
             false

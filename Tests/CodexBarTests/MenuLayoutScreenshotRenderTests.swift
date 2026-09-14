@@ -1041,6 +1041,7 @@ extension MenuLayoutScreenshotRenderTests {
             last30DaysTokens: 1400,
             last30DaysCostUSD: 14,
             historyDays: 30,
+            historyCoverageIsEstablished: ProcessInfo.processInfo.environment["CODEXBAR_QUOTA_WINDOW_PARTIAL"] != "1",
             daily: [
                 CostUsageDailyReport.Entry(
                     date: "2026-07-08",

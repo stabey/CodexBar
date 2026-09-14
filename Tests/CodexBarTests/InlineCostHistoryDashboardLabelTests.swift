@@ -173,12 +173,14 @@ struct InlineCostHistoryDashboardLabelTests {
 
         let sevenDays = makeModel(historyDays: 7)
         #expect(sevenDays.inlineUsageDashboard?.kpis.map(\.title) == [
-            "Today", "Current window", "Latest tokens", "Current window tokens",
+            "Today", "Last 7 days Cost", "Latest tokens", "Last 7 days tokens",
         ])
+
+        #expect(sevenDays.inlineUsageDashboard?.quotaWindows.isEmpty == true)
 
         let thirtyDays = makeModel(historyDays: 30)
         #expect(thirtyDays.inlineUsageDashboard?.kpis.map(\.title) == [
-            "Today", "Current window", "Latest tokens", "Current window tokens", "30d cost", "30d tokens",
+            "Today", "30d cost", "Latest tokens", "30d tokens",
         ])
     }
 
@@ -228,7 +230,7 @@ struct InlineCostHistoryDashboardLabelTests {
             now: now))
 
         #expect(model.inlineUsageDashboard?.kpis.map(\.title) == [
-            "Today", "Current window", "Latest tokens", "Current window tokens", "This month", "This month tokens",
+            "Today", "This month", "Latest tokens", "This month tokens",
         ])
     }
 
@@ -287,10 +289,8 @@ struct InlineCostHistoryDashboardLabelTests {
         #expect(dashboard.accessibilityLabel == "Codex: 30d cost")
         #expect(dashboard.kpis.map(\.title) == [
             "Today",
-            "Current window",
-            "Latest tokens",
-            "Current window tokens",
             "30d",
+            "Latest tokens",
             "30d tokens",
         ])
         #expect(dashboard.detailLines == [
@@ -562,9 +562,9 @@ struct InlineCostHistoryDashboardLabelTests {
         let dashboard = try #require(model.inlineUsageDashboard)
         #expect(dashboard.kpis.map(\.title) == [
             "Today",
-            "Current window",
+            "Est. Current window",
             "Latest tokens",
-            "Current window tokens",
+            "Est. Current window tokens",
             "30d",
             "30d tokens",
         ])
@@ -811,7 +811,7 @@ struct InlineCostHistoryDashboardLabelTests {
             hidePersonalInfo: false,
             costUsageBucketCalendar: calendar,
             now: now,
-            observedWeeklyNextResets: [official]))
+            observedWeeklyResets: [.init(capturedAt: official.addingTimeInterval(-3600), resetsAt: official)]))
 
         let dashboard = try #require(model.inlineUsageDashboard)
         #expect(dashboard.quotaWindows.map(\.title) == [

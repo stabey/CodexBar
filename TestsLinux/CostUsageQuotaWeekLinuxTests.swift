@@ -4,7 +4,7 @@ import Testing
 
 struct CostUsageQuotaWeekLinuxTests {
     @Test
-    func `rolling weeks match last 7 calendar days when reset is unknown`() {
+    func `unknown reset preserves calendar summaries without claiming quota windows`() {
         let snapshot = Self.snapshot(
             historyDays: 30,
             daily: [
@@ -15,16 +15,10 @@ struct CostUsageQuotaWeekLinuxTests {
             ],
             updatedAt: Self.utcDate(year: 2026, month: 7, day: 15, hour: 12))
 
-        let weeks = snapshot.quotaWeekSummaries(resetAt: nil, calendar: Self.utcCalendar)
-        let current = weeks.first { $0.offset == 0 }
-        let last = weeks.first { $0.offset == 1 }
-
-        #expect(current?.totalCostUSD == 7)
-        #expect(current?.totalTokens == 700)
-        #expect(current?.entryCount == 2)
-        #expect(last?.totalCostUSD == 3)
-        #expect(last?.totalTokens == 300)
-        #expect(weeks.first { $0.offset == 2 }?.totalCostUSD == 1)
+        #expect(snapshot.quotaWeekSummaries(resetAt: nil, calendar: Self.utcCalendar).isEmpty)
+        let rolling = snapshot.summary(forLastDays: 7, calendar: Self.utcCalendar)
+        #expect(rolling.totalCostUSD == 7)
+        #expect(rolling.totalTokens == 700)
     }
 
     @Test
@@ -74,11 +68,8 @@ struct CostUsageQuotaWeekLinuxTests {
             historyDays: 30,
             daily: [Self.entry(day: "2026-10-28", cost: 4, tokens: 400)],
             updatedAt: now)
-        let current = snapshot.quotaWeekSummaries(resetAt: nil, now: now, calendar: calendar)
-            .first { $0.isCurrent }
-        #expect(current?.start == currentStart)
-        #expect(current?.totalCostUSD == 4)
-        #expect(current?.totalTokens == 400)
+        #expect(snapshot.quotaWeekSummaries(resetAt: nil, now: now, calendar: calendar).isEmpty)
+        #expect(snapshot.summary(forLastDays: 7, calendar: calendar).totalCostUSD == 4)
     }
 
     @Test
@@ -191,7 +182,8 @@ struct CostUsageQuotaWeekLinuxTests {
             daily: [Self.entry(day: "2026-07-15", cost: 5, tokens: 50)],
             updatedAt: Self.utcDate(year: 2026, month: 7, day: 15, hour: 12))
 
-        let weeks = snapshot.quotaWeekSummaries(resetAt: nil, calendar: Self.utcCalendar)
+        let weeks = snapshot.quotaWeekSummaries(
+            resetAt: Self.utcDate(year: 2026, month: 7, day: 16, hour: 0), calendar: Self.utcCalendar)
         #expect(weeks.map(\.offset) == [0])
         #expect(weeks.first?.totalCostUSD == 5)
     }

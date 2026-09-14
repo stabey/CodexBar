@@ -619,9 +619,9 @@ struct ProvidersPane: View {
             paceVisible: self.settings.paceVisible,
             costUsageBucketCalendar: self.settings.costUsageBucketCalendar,
             now: now,
-            observedWeeklyNextResets: ProviderDescriptorRegistry.descriptor(for: provider)
+            observedWeeklyResets: ProviderDescriptorRegistry.descriptor(for: provider)
                 .presentation.menuCard.showsQuotaWeekCost
-                ? self.store.weeklyQuotaWindowResetDates(for: provider)
+                ? self.store.weeklyQuotaWindowResetObservations(for: provider, snapshot: snapshot)
                 : [])
         return UsageMenuCardView.Model.make(input)
     }

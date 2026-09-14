@@ -180,6 +180,7 @@ extension InlineUsageDashboardModel.QuotaWindow {
             MenuCardHeightFingerprint.field("qwTitle", self.title),
             MenuCardHeightFingerprint.field("qwRange", self.range),
             MenuCardHeightFingerprint.field("qwValue", self.value),
+            MenuCardHeightFingerprint.field("qwNote", self.note),
         ])
     }
 }

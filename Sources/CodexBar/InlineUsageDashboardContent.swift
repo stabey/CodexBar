@@ -27,6 +27,7 @@ struct InlineUsageDashboardModel: Equatable {
         let title: String
         let range: String
         let value: String
+        var note: String?
     }
 
     let accessibilityLabel: String
@@ -144,6 +145,7 @@ extension UsageMenuCardView.Model {
         let rows: [InlineUsageDashboardModel.QuotaWindow]
         let insertsKPIs: Bool
         let relabelsHistory: Bool
+        let boundariesAreEstimated: Bool
         let costValue: String
         let tokenValue: String
     }
@@ -155,12 +157,18 @@ extension UsageMenuCardView.Model {
         convertedString: (Double) -> String) -> CostHistoryQuotaPresentation
     {
         let weeklyWindow = Self.weeklyQuotaWindow(from: input)
+        var observations = input.observedWeeklyResets
+        if let resetAt = CostUsageTokenSnapshot.quotaWeekReset(from: weeklyWindow),
+           let capturedAt = input.snapshot?.updatedAt
+        {
+            observations.append(.init(capturedAt: capturedAt, resetsAt: resetAt))
+        }
         let quotaWeeks = Self.showsQuotaWeekCost(for: input.provider) && historyDays >= 7
             ? snapshot.quotaWeekSummaries(
                 resetAt: CostUsageTokenSnapshot.quotaWeekReset(from: weeklyWindow),
                 windowMinutes: weeklyWindow?.windowMinutes,
-                observedNextResets: input.observedWeeklyNextResets,
                 observedResetInstants: Self.redeemedWeeklyResetInstants(from: input.snapshot),
+                resetObservations: observations,
                 now: input.now,
                 calendar: input.costUsageBucketCalendar)
             : []
@@ -176,8 +184,12 @@ extension UsageMenuCardView.Model {
             rows: rows,
             insertsKPIs: currentWeek != nil && historyDays > 7 && snapshot.last30DaysRequests == nil,
             relabelsHistory: currentWeek != nil && historyDays == 7 && snapshot.last30DaysRequests == nil,
-            costValue: currentWeek?.totalCostUSD.map(convertedString) ?? "—",
-            tokenValue: currentWeek?.totalTokens.map(UsageFormatter.tokenCountString) ?? "—")
+            boundariesAreEstimated: currentWeek?.boundariesAreEstimated == true,
+            costValue: Self.quotaMetricValue(
+                currentWeek?.totalCostUSD.map(convertedString), complete: currentWeek?.costIsComplete == true),
+            tokenValue: Self.quotaMetricValue(
+                currentWeek?.totalTokens.map(UsageFormatter.tokenCountString),
+                complete: currentWeek?.tokensAreComplete == true))
     }
 
     private static func costHistoryDetailLines(
@@ -294,8 +306,9 @@ extension UsageMenuCardView.Model {
             snapshot: snapshot,
             historyDays: historyDays,
             convertedString: convertedString)
-        let weekCostTitle = L("Current window")
-        let weekTokenTitle = L("%@ tokens", L("Current window"))
+        let weekCostTitle = quota.boundariesAreEstimated ? L("Estimated: %@", L("Current window")) : L("Current window")
+        let rawTokenTitle = L("%@ tokens", L("Current window"))
+        let weekTokenTitle = quota.boundariesAreEstimated ? L("Estimated: %@", rawTokenTitle) : rawTokenTitle
         let details = Self.costHistoryDetailLines(
             input: input,
             snapshot: snapshot,
@@ -369,21 +382,32 @@ extension UsageMenuCardView.Model {
         } ?? []
     }
 
-    private static func quotaWindowRow(
+    static func quotaMetricValue(_ value: String?, complete: Bool) -> String {
+        guard let value else { return "—" }
+        return complete ? value : "≥ \(value)"
+    }
+
+    static func quotaWindowRow(
         week: CostUsageQuotaWeek,
         cost: String,
         calendar: Calendar) -> InlineUsageDashboardModel.QuotaWindow
     {
-        let value: String = if let totalTokens = week.totalTokens {
-            "\(cost) · \(UsageFormatter.tokenCountString(totalTokens))"
+        let costValue = Self.quotaMetricValue(week.totalCostUSD == nil ? nil : cost, complete: week.costIsComplete)
+        let tokenValue = Self.quotaMetricValue(
+            week.totalTokens.map(UsageFormatter.tokenCountString), complete: week.tokensAreComplete)
+        let value: String = if week.totalTokens != nil {
+            "\(costValue) · \(tokenValue)"
         } else {
-            cost
+            costValue
         }
+        let range = Self.quotaWindowRangeLabel(start: week.start, end: week.end, calendar: calendar)
         return InlineUsageDashboardModel.QuotaWindow(
             id: "\(week.offset)-\(Int(week.start.timeIntervalSince1970))",
             title: Self.quotaWeekHistoryLabel(week: week),
-            range: Self.quotaWindowRangeLabel(start: week.start, end: week.end, calendar: calendar),
-            value: value)
+            range: week.boundariesAreEstimated ? L("Estimated: %@", range) : range,
+            value: value,
+            note: (!week.costIsComplete && week.totalCostUSD != nil)
+                || (!week.tokensAreComplete && week.totalTokens != nil) ? L("Partial estimate") : nil)
     }
 
     static func quotaWindowRangeLabel(
@@ -611,6 +635,12 @@ struct InlineUsageDashboardContent: View {
                             .lineLimit(1)
                             .minimumScaleFactor(0.8)
                             .monospacedDigit()
+                    }
+                    if let note = window.note {
+                        Text(note)
+                            .font(.caption2)
+                            .foregroundStyle(MenuHighlightStyle.secondary(self.isHighlighted))
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     Text(window.range)
                         .font(.caption2)

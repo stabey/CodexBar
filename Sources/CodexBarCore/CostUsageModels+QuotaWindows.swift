@@ -6,14 +6,15 @@ extension CostUsageTokenSnapshot {
     /// Buckets local cost into consecutive quota windows.
     ///
     /// Pass the live Weekly `resetsAt` / `windowMinutes` to match the quota bar. When reset
-    /// metadata is missing, windows fall back to rolling calendar weeks ending tomorrow.
+    /// metadata is missing, no quota summaries are returned; calendar reports remain available.
     /// Exact slices use half-open `[start, end)` membership so an event is never counted in two
     /// windows. Legacy hour buckets and daily residuals are treated as intervals; if a reset cuts
     /// such a coarse interval, that interval is omitted instead of guessing its side. Other days
     /// and fully contained buckets in the same window still count.
     ///
     /// `observedNextResets` are previously published Weekly `resetsAt` values (for example from
-    /// plan-utilization samples). An elapsed stored next-reset is treated as a real reset instant,
+    /// legacy callers). Pass `resetObservations` to retain forecast chronology. Cancelled forecasts
+    /// are excluded from elapsed reset candidates. Unconfirmed boundaries remain estimated,
     /// so an official rollover and a later banked reset on the same day become two windows instead
     /// of one 7-day block. Gaps larger than one quota week between those observed resets are filled
     /// with nominal weekly boundaries. `observedResetInstants` are known start times such as a
@@ -23,13 +24,21 @@ extension CostUsageTokenSnapshot {
         windowMinutes: Int? = nil,
         observedNextResets: [Date] = [],
         observedResetInstants: [Date] = [],
+        resetObservations: [CostUsageQuotaResetObservation] = [],
         weekCount: Int = 4,
         now: Date? = nil,
         calendar: Calendar = .current) -> [CostUsageQuotaWeek]
     {
+        guard let resetAt, resetAt.timeIntervalSince1970.isFinite else { return [] }
         let calendar = CostUsageLocalDay.gregorianCalendar(matching: calendar)
         let now = now ?? self.updatedAt
         let duration = TimeInterval(Self.normalizedQuotaWeekMinutes(windowMinutes) * 60)
+        let evidence = QuotaResetEvidence(
+            observations: resetObservations,
+            resetInstants: observedResetInstants,
+            duration: duration,
+            now: now)
+        guard !evidence.isCancelled(resetAt) else { return [] }
         let currentEnd = Self.currentQuotaWeekEnd(
             resetAt: resetAt,
             duration: duration,
@@ -48,13 +57,13 @@ extension CostUsageTokenSnapshot {
         let count = max(1, min(weekCount, 8))
         let boundaries = Self.quotaWeekBoundaries(
             currentEnd: currentEnd,
-            observed: (observedNextResets, observedResetInstants),
+            observed: (observedNextResets + evidence.observations.map(\.resetsAt), evidence),
             weekCount: count,
             now: now,
             stride: QuotaWeekStride(
                 duration: duration,
                 calendar: calendar,
-                usesCalendarFallback: resetAt == nil))
+                usesCalendarFallback: false))
         var weeks: [CostUsageQuotaWeek] = []
         weeks.reserveCapacity(count)
         var offset = 0
@@ -78,7 +87,13 @@ extension CostUsageTokenSnapshot {
                 end: end,
                 totalTokens: projection.totalTokens,
                 totalCostUSD: projection.totalCostUSD,
-                entryCount: projection.entryCount))
+                entryCount: projection.entryCount,
+                tokensAreComplete: projection.tokensAreComplete && self.historyCoverageIsEstablished
+                    && start >= historyStart,
+                costIsComplete: projection.costIsComplete && self.historyCoverageIsEstablished
+                    && start >= historyStart,
+                boundariesAreEstimated: !evidence.confirms(start)
+                    || (offset > 0 && !evidence.confirms(end)) || resetAt <= now))
             offset += 1
         }
         return weeks
@@ -93,6 +108,7 @@ extension CostUsageTokenSnapshot {
         liveNextReset: Date?,
         observedNextResets: [Date],
         observedResetInstants: [Date] = [],
+        resetObservations: [CostUsageQuotaResetObservation] = [],
         windowMinutes: Int? = nil,
         weekCount: Int = 4,
         now: Date,
@@ -100,6 +116,11 @@ extension CostUsageTokenSnapshot {
     {
         let calendar = CostUsageLocalDay.gregorianCalendar(matching: calendar)
         let duration = TimeInterval(self.normalizedQuotaWeekMinutes(windowMinutes) * 60)
+        let evidence = QuotaResetEvidence(
+            observations: resetObservations,
+            resetInstants: observedResetInstants,
+            duration: duration,
+            now: now)
         let currentEnd = self.currentQuotaWeekEnd(
             resetAt: liveNextReset,
             duration: duration,
@@ -107,7 +128,7 @@ extension CostUsageTokenSnapshot {
             calendar: calendar)
         return self.quotaWeekBoundaries(
             currentEnd: currentEnd,
-            observed: (observedNextResets, observedResetInstants),
+            observed: (observedNextResets + evidence.observations.map(\.resetsAt), evidence),
             weekCount: max(1, min(weekCount, 8)),
             now: now,
             stride: QuotaWeekStride(
@@ -132,7 +153,7 @@ extension CostUsageTokenSnapshot {
 
     private static func quotaWeekBoundaries(
         currentEnd: Date,
-        observed: (nextResets: [Date], resetInstants: [Date]),
+        observed: (nextResets: [Date], evidence: QuotaResetEvidence),
         weekCount: Int,
         now: Date,
         stride: QuotaWeekStride) -> [Date]
@@ -141,21 +162,20 @@ extension CostUsageTokenSnapshot {
             currentEnd,
             stride.step(from: currentEnd, weeks: -1),
         ]
-        dates.reserveCapacity(weekCount + 1 + observed.nextResets.count * 2 + observed.resetInstants.count)
-        for next in observed.nextResets {
-            // A persisted `resetsAt` in the future is still useful for recovering the
-            // corresponding historical window start, but it has not happened yet and must not
-            // split the live current window. Once it has elapsed, it is a real reset instant
-            // (including an early/banked reset) and becomes an additional boundary.
+        dates.reserveCapacity(weekCount + 1 + observed.nextResets.count * 2 + observed.evidence.resetInstants.count)
+        for next in observed.nextResets where next.timeIntervalSince1970.isFinite {
+            // Retain the prior period's nominal start, but never revive a cancelled forecast.
             dates.append(stride.step(from: next, weeks: -1))
-            if next <= now.addingTimeInterval(self.quotaWeekBoundaryTolerance) {
+            if next <= now, !observed.evidence.isCancelled(next) {
                 dates.append(next)
             }
         }
-        dates.append(contentsOf: observed.resetInstants)
         let latestAllowed = currentEnd.addingTimeInterval(self.quotaWeekBoundaryTolerance)
+        // Only the requested recent windows can be displayed. Bound gap filling even for
+        // very old, but finite, persisted dates.
+        let earliestNeeded = stride.step(from: currentEnd, weeks: -(weekCount + 2))
         var unique = self.uniqueSortedDates(dates, tolerance: self.quotaWeekBoundaryTolerance)
-            .filter { $0 <= latestAllowed }
+            .filter { $0 >= earliestNeeded && $0 <= latestAllowed }
         // The live reset is authoritative. Ascending tolerance de-duplication otherwise keeps an
         // older observed reset and can make the current window end just before `now`.
         unique.removeAll { abs($0.timeIntervalSince(currentEnd)) < self.quotaWeekBoundaryTolerance }
@@ -169,7 +189,17 @@ extension CostUsageTokenSnapshot {
             unique.insert(stride.step(from: oldest, weeks: -1), at: 0)
             unique = self.uniqueSortedDates(unique, tolerance: self.quotaWeekBoundaryTolerance)
         }
-        return unique
+        let elapsedForecasts = Set(observed.nextResets.filter { $0 <= now && !observed.evidence.isCancelled($0) })
+        unique.removeAll { date in
+            date != currentEnd && !elapsedForecasts.contains(date)
+                && observed.evidence.resetInstants.contains {
+                    abs($0.timeIntervalSince(date)) < self.quotaWeekBoundaryTolerance
+                }
+        }
+        // Exact redeemed instants must survive forecast jitter de-duplication, including
+        // multiple real resets less than two minutes apart.
+        unique.append(contentsOf: observed.evidence.resetInstants.filter { $0 >= earliestNeeded && $0 < currentEnd })
+        return Array(Set(unique)).sorted()
     }
 
     /// Insert nominal weekly ticks inside gaps larger than one quota week, so a 30-day hole
@@ -339,6 +369,8 @@ extension CostUsageTokenSnapshot {
         let totalTokens: Int?
         let totalCostUSD: Double?
         let entryCount: Int
+        let tokensAreComplete: Bool
+        let costIsComplete: Bool
     }
 
     private enum QuotaReconciliation {
@@ -482,8 +514,13 @@ extension CostUsageTokenSnapshot {
         var sawCost = false
         var costIsValid = true
         var entryCount = 0
+        var tokensAreComplete = true
+        var costIsComplete = true
 
         for day in days where day.overlaps(start: start, end: end) {
+            let coverage = self.quotaWindowCoverage(day: day, start: start, end: end)
+            tokensAreComplete = tokensAreComplete && coverage.tokens
+            costIsComplete = costIsComplete && coverage.cost
             let tokenContribution = self.projectQuotaTokens(day: day, start: start, end: end)
             if !tokenContribution.isValid {
                 tokensAreValid = false
@@ -519,7 +556,44 @@ extension CostUsageTokenSnapshot {
         return QuotaWindowProjection(
             totalTokens: tokensAreValid && sawTokens ? totalTokens : nil,
             totalCostUSD: costIsValid && sawCost ? totalCost : nil,
-            entryCount: entryCount)
+            entryCount: entryCount,
+            tokensAreComplete: tokensAreComplete && tokensAreValid && sawTokens,
+            costIsComplete: costIsComplete && costIsValid && sawCost)
+    }
+
+    /// Completeness is independent of the useful subtotal retained by the projection.
+    private static func quotaWindowCoverage(
+        day: QuotaProjectionDay,
+        start: Date,
+        end: Date) -> (tokens: Bool, cost: Bool)
+    {
+        var tokens = true
+        var cost = true
+        for slice in day.slices where slice.overlaps(start: start, end: end) {
+            let contained = slice.isContained(start: start, end: end)
+            tokens = tokens && contained && slice.totalTokens.map { $0 >= 0 } == true
+            cost = cost && contained && slice.costUSD.map { $0.isFinite && $0 >= 0 } == true
+        }
+        if let daily = day.daily {
+            if day.isContained(start: start, end: end) {
+                // A complete daily fallback can cover missing/coarse temporal details.
+                tokens = daily.totalTokens.map { $0 >= 0 } == true
+                cost = self.completeDailyCost(daily) != nil
+            }
+            tokens = tokens && daily.totalTokens != nil && max(0, daily.unmeteredRequestCount ?? 0) == 0
+            cost = cost && self.completeDailyCost(daily) != nil
+                && max(0, daily.unpricedRequestCount ?? 0) == 0
+                && !(daily.modelBreakdowns ?? []).contains { $0.costUSD == nil }
+            if !day.isContained(start: start, end: end) {
+                if let value = daily.totalTokens {
+                    tokens = tokens && self.tokenReconciliation(day.slices, daily: value) == .exact
+                }
+                if let value = daily.costUSD {
+                    cost = cost && self.costReconciliation(day.slices, daily: value) == .exact
+                }
+            }
+        }
+        return (tokens, cost)
     }
 
     private static func projectQuotaTokens(
